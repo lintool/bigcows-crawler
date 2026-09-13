@@ -15,23 +15,26 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from cache_acm_fellow_profiles import (
-    DEFAULT_CACHE, DEFAULT_REPORT, atomic_write_json, build_report, load_json,
+    crawl_path, parse_crawl_date, atomic_write_json, build_report, load_json,
     load_rows, looks_blocked, parse_profile_html, unique_profiles,
+    ensure_manifest, latest_attempt, record_attempt,
 )
 
 FETCH_SCRIPT = Path(__file__).with_name('acm_safari_fetch.applescript')
 TRANSIENT = {'blocked', 'url_error', 'timeout'}
-STATUSES = TRANSIENT | {'http_error', 'no_name', 'no_fellow_award', 'invalid_url'}
+STATUSES = TRANSIENT | {'http_error', 'no_name', 'no_fellow_award', 'invalid_url', 'validation_error'}
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, required=True)
-    p.add_argument('--cache', type=Path, default=DEFAULT_CACHE)
-    p.add_argument('--report', type=Path, default=DEFAULT_REPORT)
-    p.add_argument('--state', type=Path, help='Progress JSON; defaults to CACHE.status.json.')
-    p.add_argument('--refresh', action='store_true', help='Refetch every selected URL; use a new cache for a resumable fresh run.')
+    p.add_argument('--crawl-date', type=parse_crawl_date, required=True, help='Crawl start date (YYYY-MM-DD); keep the same date when resuming.')
+    p.add_argument('--cache', type=Path, help='Override the dated JSON cache path.')
+    p.add_argument('--report', type=Path, help='Override the dated JSON report path.')
+    p.add_argument('--state', type=Path, help='Override the dated progress JSON path.')
+    p.add_argument('--refresh', action='store_true', help='Refetch every selected URL; use a new crawl date for a resumable fresh run.')
     p.add_argument('--retry-status', action='append', choices=sorted(STATUSES), default=[])
+    p.add_argument('--accept-profile', action='append', default=[], metavar='URL', help='Accept a saved name/year validation mismatch for this exact URL after manual review.')
     p.add_argument('--limit-new', type=int, help='Maximum distinct profiles to fetch; 0 rebuilds reports without Safari.')
     p.add_argument('--pilot-size', type=int, default=5, help='Validate name/year for the first N fetched profiles; 0 disables the pilot gate.')
     p.add_argument('--delay', type=float, default=6.0)
@@ -49,7 +52,9 @@ def parse_args():
             p.error(f'--{name.replace("_", "-")} must be nonnegative')
     if args.batch_size < 1 or args.timeout <= 0 or (args.limit_new is not None and args.limit_new < 0):
         p.error('batch size and timeout must be positive; limit-new must be nonnegative')
-    args.state = args.state or args.cache.with_suffix('.status.json')
+    args.cache = args.cache or crawl_path('cache', args.crawl_date)
+    args.report = args.report or crawl_path('report', args.crawl_date)
+    args.state = args.state or crawl_path('state', args.crawl_date)
     if len({path.resolve() for path in (args.data, args.cache, args.report, args.state)}) != 4:
         p.error('input, cache, report, and state paths must be distinct')
     return args
@@ -66,7 +71,7 @@ def jittered(base, jitter):
 def should_fetch(entry, refresh, retry_statuses):
     if refresh or not entry:
         return True
-    status = entry.get('status')
+    status = latest_attempt(entry).get('status')
     return status in TRANSIENT | set(retry_statuses) or (status == 'ok' and not entry.get('html'))
 
 
@@ -122,6 +127,21 @@ def main():
     args = parse_args()
     profiles = unique_profiles(load_rows(args.data))
     cache = load_json(args.cache, {})
+    try:
+        ensure_manifest(args)
+        profile_urls = {p.url for p in profiles}
+        for url in args.accept_profile:
+            if url not in profile_urls or latest_attempt(cache.get(url, {})).get('status') != 'validation_error':
+                raise ValueError('--accept-profile requires an input URL with a saved validation_error.')
+        for url in args.accept_profile:
+            accepted = dict(latest_attempt(cache[url]))
+            accepted['status'] = 'ok'
+            accepted['accepted_validation_error'] = accepted.pop('validation_error')
+            accepted.pop('pilot_validation_failed', None)
+            cache[url] = accepted
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 1
     pending = [p for p in profiles if should_fetch(cache.get(p.url), args.refresh, args.retry_status)]
     if args.limit_new is not None:
         pending = pending[:args.limit_new]
@@ -133,7 +153,7 @@ def main():
         atomic_write_json(args.cache, cache)
         atomic_write_json(args.report, report)
         atomic_write_json(args.state, {
-            'state': state, 'detail': detail, 'updated_at': timestamp(),
+            'state': state, 'detail': detail, 'updated_at': timestamp(), 'crawl_date': args.crawl_date,
             'browser_mode': 'regular Safari via AppleScript', 'safari_window_id': window_id,
             'total_profiles': len(profiles), 'fetched_this_run': fetched, 'attempts_this_run': attempts,
             'cached_profiles': report['cached_profiles'], 'status_counts': report['status_counts'],
@@ -142,12 +162,20 @@ def main():
         print(f'{state}: {detail}', flush=True)
 
     try:
+        retry_urls = {p.url for p in pending}
+        unresolved = [p for p in profiles if (latest_attempt(cache.get(p.url, {})).get('status') == 'validation_error' or latest_attempt(cache.get(p.url, {})).get('pilot_validation_failed')) and p.url not in retry_urls]
+        if unresolved:
+            save('paused', f'Unresolved pilot validation: {unresolved[0].url}. Review, then retry its saved status or use --accept-profile URL for a name/year mismatch.')
+            return 1
         if not pending:
             save('complete', 'No fetches requested; report rebuilt from cache.')
             return 0
         window_id = open_window()
         save('running', f'{len(pending)} profiles selected.')
         for profile in pending:
+            previous_attempt = latest_attempt(cache.get(profile.url, {}))
+            validate_profile = (fetched < args.pilot_size or previous_attempt.get('pilot_validation_failed')
+                                or previous_attempt.get('status') == 'validation_error')
             for attempt in range(args.max_retries + 1):
                 if batch_attempts >= args.batch_size:
                     pause = jittered(args.batch_pause, args.batch_pause_jitter)
@@ -156,7 +184,13 @@ def main():
                     batch_attempts = 0
                 print(f'[{fetched + 1}/{len(pending)}] {profile.name}; attempt {attempt + 1}', flush=True)
                 entry = fetch_profile(window_id, profile.url, args.timeout)
-                cache[profile.url] = entry
+                if validate_profile and entry['status'] == 'ok':
+                    check = build_report([profile], {profile.url: entry})['entries'][0]
+                    if not check['name_match'] or (profile.year and not check['year_match']):
+                        entry = {**entry, 'status': 'validation_error', 'validation_error': 'Pilot name/year mismatch.'}
+                if validate_profile and entry['status'] != 'ok':
+                    entry = {**entry, 'pilot_validation_failed': True}
+                record_attempt(cache, profile.url, entry)
                 attempts += 1
                 batch_attempts += 1
                 save('running', f'{profile.name}: {entry["status"]}')
@@ -170,7 +204,7 @@ def main():
                 save('backoff', f'Retry in {pause:.1f}s.')
                 time.sleep(pause)
             fetched += 1
-            if fetched <= args.pilot_size:
+            if validate_profile:
                 check = build_report([profile], cache)['entries'][0]
                 if entry['status'] != 'ok' or not check['name_match'] or (profile.year and not check['year_match']):
                     save('paused', f'Pilot validation needs review: {profile.name}.')

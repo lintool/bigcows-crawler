@@ -31,7 +31,7 @@ class SafariTests(unittest.TestCase):
         self.source = self.work / 'input.csv'
         self.cache = self.work / 'cache.json'
         self.report = self.work / 'report.json'
-        self.state = self.work / 'cache.status.json'
+        self.state = self.work / 'state.json'
         self.write_input([URL])
 
     def write_input(self, urls):
@@ -41,7 +41,8 @@ class SafariTests(unittest.TestCase):
             writer.writerows(['Example Person', '2025', url] for url in urls)
 
     def run_crawler(self, *extra):
-        args = [safari.__file__, '--data', str(self.source), '--cache', str(self.cache),
+        args = [safari.__file__, '--data', str(self.source), '--crawl-date', '2026-09-13',
+                '--cache', str(self.cache), '--state', str(self.state),
                 '--report', str(self.report), '--delay', '0', '--backoff', '0',
                 '--backoff-jitter', '0', *extra]
         with patch.object(sys, 'argv', args), contextlib.redirect_stdout(io.StringIO()):
@@ -53,6 +54,25 @@ class SafariTests(unittest.TestCase):
             self.assertEqual(self.run_crawler('--limit-new', '0'), 0)
         self.assertEqual(self.source.read_bytes(), before)
         self.assertEqual(json.loads(self.report.read_text())['status_counts'], {'missing': 1})
+
+    def test_dated_runs_resume_and_keep_other_dates_unchanged(self):
+        with patch('cache_acm_fellow_profiles.CRAWLER_ROOT', self.work), patch.object(safari, 'open_window', return_value=123), patch.object(safari, 'close_window'), patch.object(safari, 'fetch_profile', return_value=safari.entry_from_html(URL, HTML)) as fetch:
+            def run(day, *extra):
+                argv = [safari.__file__, '--data', str(self.source), '--crawl-date', day, *extra]
+                with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(safari.main(), 0)
+            run('2026-09-13')
+            run('2026-09-13')
+            self.assertEqual(fetch.call_count, 1)
+            first = {p: p.read_bytes() for p in (self.work / '.cache').iterdir()}
+            run('2026-09-14', '--limit-new', '0')
+            self.assertEqual(fetch.call_count, 1)
+            state = json.loads(safari.crawl_path('state', '2026-09-14').read_text())
+            self.assertEqual(state['crawl_date'], '2026-09-14')
+            self.assertIsNone(state['safari_window_id'])
+            run('2026-09-14')
+            self.assertEqual(fetch.call_count, 2)
+            self.assertTrue(all(p.read_bytes() == content for p, content in first.items()))
 
     def test_native_html_parsing_does_not_invent_http_status(self):
         with patch.object(safari, 'run_applescript', return_value=URL + '\n' + HTML):

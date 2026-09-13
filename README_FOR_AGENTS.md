@@ -7,7 +7,11 @@ See [README.md](README.md) for input columns and shared-cache usage.
 ## ACM Fellow Profile Crawler
 
 `scripts/cache_acm_fellow_profiles_safari.py` is the recommended ACM crawler on macOS.
-It controls a dedicated window in regular Safari through AppleScript and caches the `acm_fellow_profile` URLs in the caller-supplied CSV:
+`scripts/cache_acm_fellow_profiles.py` supplies its parser, cache helpers, and
+report builder; that module's legacy HTTP entry point remains for compatibility
+but can encounter blocking. The retired ACM Playwright transport is not supported.
+The Safari crawler controls a dedicated browser window through AppleScript and
+caches the `acm_fellow_profile` URLs in the caller-supplied CSV:
 
 ```text
 path/to/input.csv
@@ -22,31 +26,61 @@ The script:
 - fetches each ACM profile page conservatively;
 - caches the complete fetched HTML page for reuse;
 - parses the page name, ACM Fellows award heading, location, year, and citation when available;
-- normalizes parsed page names by removing leading honorifics such as `Dr.`, `Prof.`, `Professor`, and trailing credentials such as `PhD` / `Ph.D.`;
+- removes recognized honorifics and credentials from parsed names; unusual or repeated titles and duplicated name parts can remain and need review;
 - compares parsed fields against the CSV row;
 - writes a JSON cache and a JSON report;
 - does not modify CSV files.
 
-Basic commands:
+Start a new crawl with a date and an input snapshot, then repeat that command to
+resume. Replace the example date with the crawl start date:
 
 ```bash
-python3 scripts/cache_acm_fellow_profiles_safari.py --data path/to/input.csv --limit-new 0
-python3 scripts/cache_acm_fellow_profiles_safari.py --data path/to/input.csv --limit-new 5
-python3 scripts/cache_acm_fellow_profiles_safari.py --data path/to/input.csv
-python3 scripts/cache_acm_fellow_profiles_safari.py --data path/to/input.csv --retry-status http_error
+python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data path/to/input.csv --limit-new 5
+python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data path/to/input.csv
+python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data path/to/input.csv --retry-status http_error
 ```
 
-For a fresh crawl, choose a new `.cache/` directory; repeat the same command to
-resume without touching the previous cache:
+Both ACM entry points require `--crawl-date YYYY-MM-DD`, including cache-only
+runs and commands with explicit path overrides. The date must be a valid calendar
+date and identifies the crawl's start date, not each page's fetch date. Keep it
+unchanged when resuming across midnight. For a read-only comparison against a
+completed crawl, use the separate command with any application's current CSV:
 
 ```bash
-python3 scripts/cache_acm_fellow_profiles_safari.py --data path/to/input.csv --cache .cache/acm-refresh/cache.json --report .cache/acm-refresh/report.json
+python3 scripts/compare_acm_fellow_profiles.py --crawl-date 2026-09-13 --data path/to/current.csv
 ```
 
-`--refresh` refetches every selected URL and overwrites its cache entry. Omit it
+`--refresh` refetches every selected URL. Successful fetches replace the cache entry;
+failures preserve the previous successful HTML and attach the latest failed response
+as `last_attempt`. Omit it
 when resuming. Successful entries with HTML are reused; `blocked`, `timeout`, and
 `url_error` entries (and incomplete `ok` entries) are retried automatically.
 Other cached errors require `--retry-status STATUS` or `--refresh`.
+Retry selection uses `last_attempt.status` when present, so a preserved successful
+capture does not hide a failed refresh. A later successful fetch clears `last_attempt`.
+
+For independent runs on the same date, override all of `--cache`, `--report`, and
+`--state` with separate paths under `.cache/`. Each override affects only that
+path; other paths retain the date-based defaults. To preserve the input and console
+output, the caller can save `acm-fellow-profile-input-YYYY-MM-DD.csv` and
+`acm-fellow-profile-log-YYYY-MM-DD.txt` under `.cache/`; these are not generated
+automatically. Use the input snapshot as `--data` on resumes.
+
+### Crawl manifests
+
+On first invocation, both ACM crawlers create a manifest containing the start date,
+input path and SHA-256 checksum, and initial artifact paths. Subsequent invocations
+reject changed input contents, a different date, or a different cache path before
+writing crawl artifacts or fetching. An identical input snapshot at another path is
+allowed. Other applications should use the comparison command against shared captures,
+or select a separate crawl for different fetch inputs.
+
+The default manifest is `.cache/acm-fellow-profile-manifest-YYYY-MM-DD.json`.
+With `--cache custom.json`, it is `custom.manifest.json` beside that cache. Keep the
+manifest with its cache; do not delete it to bypass an input mismatch. When first
+registering an older cache without a manifest, supply its original input snapshot;
+the manifest also records `initial_cache_sha256`. That checksum describes registration
+time, not subsequent fetches. Existing manifests are not rewritten on each run.
 
 ### Safari setup and lifecycle
 
@@ -69,47 +103,37 @@ HTTP cache remain in use; a fresh local cache does not disable Safari caching.
 - `--batch-size 25 --batch-pause 75 --batch-pause-jitter 15`: pause 60–90 seconds every 25 fetch attempts, including retries.
 - `--max-retries 2 --backoff 120 --backoff-jitter 15`: at most three attempts per profile, with 120–135 then 240–255 seconds of backoff.
 - `--timeout 30`: wait up to 30 seconds for the requested page's complete HTML.
-- `--pilot-size 5`: validate status, name, and supplied year for the first five fetched profiles before continuing. `--pilot-size 0` disables this gate after independent validation.
+- `--pilot-size 5`: check status, name compatibility, and supplied year for each of the first five fetched profiles in every invocation. `--pilot-size 0` disables this gate after independent validation.
 - `--limit-new N`: cap distinct profiles fetched this invocation; retries count toward the batch size, not this cap.
-- `--state PATH`: progress JSON; defaults to the cache path with `.status.json` replacing `.json`.
+- `--state PATH`: override `.cache/acm-fellow-profile-state-YYYY-MM-DD.json`; progress includes `crawl_date`.
 
 Cache and report are saved after every attempt. Progress states are `running`,
-`cooldown`, `backoff`, `paused`, `failed`, or `complete`. A completed limited or
-cache-only run means that invocation finished, not that all input URLs have HTML;
-check report counts. Exit codes are 0 for completion, 1 for failure/review, and
-130 for interruption. All paths must be distinct from the input CSV.
+`cooldown`, `backoff`, `paused`, `failed`, or `complete`. Completion means the
+invocation finished, not that every input URL succeeded or every field matches.
+Outside the pilot, nontransient errors such as `http_error` are recorded and the
+run continues. Exit codes are 0 for completion, 1 for a paused/failed run, and
+130 for interruption. Inspect `status_counts`, missing entries, and review
+candidates even after exit code 0. Input, cache, report, and state paths must all
+be distinct.
 
 ### Troubleshooting
 
 - **Automation denied:** allow the launching app under macOS System Settings → Privacy & Security → Automation → Safari, then rerun.
 - **Window closed:** rerun with the same cache/report paths; a new dedicated window is opened and successful pages are skipped.
 - **Blocking persists:** the crawler backs off and pauses. Inspect the failed page/report before resuming; do not repeatedly restart or switch sessions to force progress.
-- **Pilot mismatch:** inspect the saved HTML and comparison report. Differences are review candidates, not automatic CSV changes.
+- **Pilot mismatch:** the failed validation is saved and remains blocked on resume, even with `--pilot-size 0`. Inspect the HTML, then use `--retry-status validation_error` to refetch. To explicitly accept a verified name/year variant without fetching, pass `--accept-profile URL --limit-new 0`; the acceptance is recorded. Other pilot errors require retrying their saved status. No CSV changes are automatic.
 - **Need to keep the Mac awake:** run the command with `caffeinate -i python3 ...`. Keep logs under `.cache/`; do not run another writer against the same cache, report, or state file.
 
-The 2026-09-13 recrawl completed at 19:53 UTC with all 1,627 supplied profile
-URLs cached and parsed successfully. Regular Safari/AppleScript sustained
-fetching after HTTP, Playwright/Chrome, and Safari WebDriver encountered blocking.
-The reusable script handled the final 1,022 fetches, including a corrected capture
-from the initial temporary runner. That stale-page capture was preserved
-separately and refetched; the reusable helper waits for the previous document to
-clear before loading the next URL. The completed cache had no duplicate HTML.
-
-Three comparison candidates remained: Nikolaj Bjørner's displayed name order,
-Frank Wm Tompa's blank citation, and Richard R. Burton's truncated citation.
-The source CSV was unchanged. These results validate this run, not future ACM
-availability. Full HTML, logs, and reports remain local under `.cache/`.
-
-Default cache path:
+Default cache path for the selected crawl date:
 
 ```text
-.cache/acm-fellow-profile-cache.json
+.cache/acm-fellow-profile-cache-YYYY-MM-DD.json
 ```
 
-Default report path:
+Default report path for the selected crawl date:
 
 ```text
-.cache/acm-fellow-profile-report.json
+.cache/acm-fellow-profile-report-YYYY-MM-DD.json
 ```
 
 The ACM cache is keyed by profile URL. Each value contains the full `html`, fetch metadata, and parsed fields such as:
@@ -143,18 +167,57 @@ Possible `status` values include:
 - `url_error`: AppleScript, browser-window, navigation, or loaded-URL validation failure.
 - `timeout`: request timed out.
 - `invalid_url`: URL is not HTTP/HTTPS.
+- `validation_error`: a fetched pilot page failed name or year compatibility; its HTML is retained for review.
 - `no_name`: page fetched but no page name was parsed.
 - `no_fellow_award`: page fetched but no `ACM Fellows` award section was parsed.
 
-The report contains `review_candidates` for rows where the page did not parse cleanly, or parsed name/year/location/citation differs from the CSV. Treat these as review candidates, not automatic CSV fixes.
+### Reports and data review
 
-When propagating ACM crawl results into `path/to/input.csv`, use only entries whose `status` is `ok`, and do not overwrite existing CSV values with blank parsed fields. The crawled page is newer than the original CSV for `name`, `year`, `location`, and `citation`, but parsed names must remain clean names as described above.
+`scripts/compare_acm_fellow_profiles.py` is the read-only audit command. It reparses
+HTML and emits JSON to stdout, or to a new file with `--output PATH`. Existing output
+files and original crawl artifacts cannot be overwritten. It never creates a cache,
+changes a manifest, updates crawl progress, or opens a browser. A missing cache is
+an error. The manifest date/cache path is checked when present, while a different
+comparison input is allowed. `crawl_input_sha256: null` denotes an unregistered cache.
 
-Historical ACM profile crawl notes (April 2026):
+Comparison output includes all input rows, `status_counts` (including `blank_url`
+and `missing`), `difference_counts`, `name_mismatch_count`, duplicate URL row indexes,
+and unreferenced cached URLs. Row indexes start at 1 for the first data row, excluding
+the header. Each captured row reports freshly parsed fields, exact CSV/page
+differences, name compatibility, capture status, and the latest attempt status.
+The command exits 0 when comparison succeeds even if differences exist; review the
+report instead of treating exit 0 as agreement. The matcher handles Unicode accents
+and spacing, and only treats a first name as an initial when it is abbreviated;
+different spelled-out first names do not match solely on their first letter.
 
-- The 2026-04-29 browser/CDP retry resolved all previously cached `blocked` pages.
-- That historical report had 1,628 `ok` entries, 0 `blocked` entries, and 11 `http_error` entries.
-- The 11 `http_error` entries are ACM 404 pages. They are documented in the consuming application's data notes.
+The following describes the crawler's own progress/comparison report:
+
+The report compares the input with cached parsed fields; `--limit-new 0` does not
+reparse HTML. It reports one entry per unique nonempty profile URL, using the
+first input row for duplicate URLs. Blank URLs are omitted. `cached_profiles`
+counts input URLs present in the cache, including failures; it is not a successful-page count.
+URLs absent from the cache appear as `missing` in `entries` and `status_counts`,
+but are excluded from `review_candidates`.
+
+`review_candidates` contains cached errors, failed latest attempts, and failed field comparisons. Years
+and locations are compared exactly, citations after whitespace normalization,
+and names with a permissive compatibility heuristic. Compatible initials, added
+name parts, and even some malformed names can pass. Missing optional comparison
+fields in the input can also produce candidates. A small candidate count is not
+an exhaustive list of textual differences or proof that profiles identify the
+right people; inspect exact name differences and the stored HTML when auditing.
+
+When applying results to application data, verify the person and award first.
+Use `status: ok` entries as evidence, not as automatic replacements. Preserve
+existing values when the source is blank, truncated, malformed, or otherwise less
+accurate. Keep clean names and review substantive conflicts against corroborating
+sources; a newer fetch date does not establish correctness. Record dataset-specific
+decisions in the consuming application.
+
+Fresh caches are separate files; there is no undated default or automatic latest
+selection. An explicit cache override still requires the date. Crawl reports describe
+the bound input snapshot; use the separate comparison command after CSV changes to
+preserve the original report and progress records.
 
 ## DBLP Profile Crawler
 
@@ -310,20 +373,6 @@ The CSRankings crawler defaults are:
 - `--backoff-jitter 2.0`
 - `--limit-new N` caps uncached requests for one run.
 - `--letters a,b,c` restricts the shard set for testing or targeted refreshes.
-
-## ACM Implementation and Retired Approaches
-
-Use `scripts/cache_acm_fellow_profiles_safari.py` for ACM profile fetching.
-`scripts/cache_acm_fellow_profiles.py` supplies the shared parser, cache helpers,
-and report builder. Its legacy HTTP entry point remains for compatibility,
-but direct HTTP was blocked in the September 2026 crawl and is not the
-recommended fetch path.
-
-The ACM Playwright crawler was removed after repeated blocking with regular
-Chrome and incognito sessions. Safari WebDriver also failed to sustain fetching.
-The working approach uses regular Safari through AppleScript; it needs neither
-Playwright nor WebDriver. The April 2026 Chrome/CDP result recorded earlier is historical
-provenance, not an installation or retry recommendation.
 
 ## Google Scholar Profile Crawler
 
