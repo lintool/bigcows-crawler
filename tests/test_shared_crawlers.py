@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 ACM = importlib.import_module("cache_acm_fellow_profiles")
 DBLP = importlib.import_module("cache_dblp_profiles")
 SCHOLAR = importlib.import_module("cache_google_scholar_profiles")
-BROWSER = importlib.import_module("cache_acm_fellow_profiles_playwright")
+SAFARI = importlib.import_module("cache_acm_fellow_profiles_safari")
 CSRANKINGS = importlib.import_module("cache_csrankings")
 
 
@@ -44,7 +44,7 @@ class SharedCrawlerTests(unittest.TestCase):
                 self.assertEqual(module.main(), 0)
 
     def test_profile_inputs_required_and_help_works_outside_repository(self):
-        for module in (ACM, DBLP, SCHOLAR, BROWSER):
+        for module in (ACM, DBLP, SCHOLAR, SAFARI):
             with self.subTest(module=module.__name__):
                 result = subprocess.run(
                     [sys.executable, "-B", module.__file__], cwd=self.work,
@@ -52,7 +52,7 @@ class SharedCrawlerTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("--data", result.stderr)
-        for module in (ACM, DBLP, SCHOLAR, BROWSER, CSRANKINGS):
+        for module in (ACM, DBLP, SCHOLAR, SAFARI, CSRANKINGS):
             result = subprocess.run(
                 [sys.executable, "-B", module.__file__, "--help"],
                 cwd=self.work, text=True, capture_output=True,
@@ -61,7 +61,7 @@ class SharedCrawlerTests(unittest.TestCase):
         self.assertEqual(list(self.work.iterdir()), [])
 
     def test_defaults_belong_to_crawler_repository(self):
-        for module in (ACM, DBLP, SCHOLAR, BROWSER, CSRANKINGS):
+        for module in (ACM, DBLP, SCHOLAR, SAFARI, CSRANKINGS):
             argv = [module.__file__]
             if module is not CSRANKINGS:
                 argv += ["--data", str(self.work / "app.csv")]
@@ -72,8 +72,7 @@ class SharedCrawlerTests(unittest.TestCase):
             self.assertTrue(cache.is_relative_to(ROOT / ".cache"))
             if module is SCHOLAR:
                 self.assertIsNone(args.output)
-            if module is BROWSER:
-                self.assertTrue(args.user_data_dir.is_relative_to(ROOT / ".cache"))
+            if module is SAFARI:
                 self.assertEqual(args.cache, ACM.DEFAULT_CACHE)
 
     def test_two_applications_reuse_profiles_and_preserve_other_cached_urls(self):

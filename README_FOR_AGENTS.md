@@ -6,7 +6,8 @@ See [README.md](README.md) for input columns and shared-cache usage.
 
 ## ACM Fellow Profile Crawler
 
-`scripts/cache_acm_fellow_profiles.py` caches the `acm_fellow_profile` URLs in the caller-supplied CSV:
+`scripts/cache_acm_fellow_profiles_safari.py` is the recommended ACM crawler on macOS.
+It controls a dedicated window in regular Safari through AppleScript and caches the `acm_fellow_profile` URLs in the caller-supplied CSV:
 
 ```text
 path/to/input.csv
@@ -16,6 +17,8 @@ The script:
 
 - reads profile rows from the required `--data` input;
 - extracts unique non-empty `acm_fellow_profile` URLs;
+- navigates Safari through its native URL property and reads the complete HTML source;
+- uses only the Python standard library and `/usr/bin/osascript` (no Playwright or WebDriver);
 - fetches each ACM profile page conservatively;
 - caches the complete fetched HTML page for reuse;
 - parses the page name, ACM Fellows award heading, location, year, and citation when available;
@@ -27,17 +30,75 @@ The script:
 Basic commands:
 
 ```bash
-python scripts/cache_acm_fellow_profiles.py --data path/to/input.csv --limit-new 0
-python scripts/cache_acm_fellow_profiles.py --data path/to/input.csv
-python scripts/cache_acm_fellow_profiles.py --data path/to/input.csv --refresh
-python scripts/cache_acm_fellow_profiles.py --data path/to/input.csv
+python3 scripts/cache_acm_fellow_profiles_safari.py --data path/to/input.csv --limit-new 0
+python3 scripts/cache_acm_fellow_profiles_safari.py --data path/to/input.csv --limit-new 5
+python3 scripts/cache_acm_fellow_profiles_safari.py --data path/to/input.csv
+python3 scripts/cache_acm_fellow_profiles_safari.py --data path/to/input.csv --retry-status http_error
 ```
 
-Compile-check the script:
+For a fresh crawl, choose a new `.cache/` directory; repeat the same command to
+resume without touching the previous cache:
 
 ```bash
-python -m py_compile scripts/cache_acm_fellow_profiles.py
+python3 scripts/cache_acm_fellow_profiles_safari.py --data path/to/input.csv --cache .cache/acm-refresh/cache.json --report .cache/acm-refresh/report.json
 ```
+
+`--refresh` refetches every selected URL and overwrites its cache entry. Omit it
+when resuming. Successful entries with HTML are reused; `blocked`, `timeout`, and
+`url_error` entries (and incomplete `ok` entries) are retried automatically.
+Other cached errors require `--retry-status STATUS` or `--refresh`.
+
+### Safari setup and lifecycle
+
+Live fetching requires macOS, Safari, and an interactive desktop session. Approve
+the macOS Automation prompt allowing your launching terminal/application to
+control Safari. This uses native AppleScript URL/source properties; it does not
+require Safari WebDriver, remote automation, JavaScript from Apple Events, a
+browser extension, or a Python browser package.
+
+The crawler opens a dedicated window, records its ID in the progress file, and
+closes only that window when it exits. Keep its window/tab open and unchanged.
+Other Safari windows are not navigated or closed. Each navigation first clears
+the previous document to avoid capturing stale HTML. Unexpected redirects or
+incomplete HTML are treated as fetch errors. The native Safari session and its
+HTTP cache remain in use; a fresh local cache does not disable Safari caching.
+
+### Pacing, validation, and progress
+
+- `--delay 6 --delay-jitter 1`: wait 5–7 seconds between profiles.
+- `--batch-size 25 --batch-pause 75 --batch-pause-jitter 15`: pause 60–90 seconds every 25 fetch attempts, including retries.
+- `--max-retries 2 --backoff 120 --backoff-jitter 15`: at most three attempts per profile, with 120–135 then 240–255 seconds of backoff.
+- `--timeout 30`: wait up to 30 seconds for the requested page's complete HTML.
+- `--pilot-size 5`: validate status, name, and supplied year for the first five fetched profiles before continuing. `--pilot-size 0` disables this gate after independent validation.
+- `--limit-new N`: cap distinct profiles fetched this invocation; retries count toward the batch size, not this cap.
+- `--state PATH`: progress JSON; defaults to the cache path with `.status.json` replacing `.json`.
+
+Cache and report are saved after every attempt. Progress states are `running`,
+`cooldown`, `backoff`, `paused`, `failed`, or `complete`. A completed limited or
+cache-only run means that invocation finished, not that all input URLs have HTML;
+check report counts. Exit codes are 0 for completion, 1 for failure/review, and
+130 for interruption. All paths must be distinct from the input CSV.
+
+### Troubleshooting
+
+- **Automation denied:** allow the launching app under macOS System Settings → Privacy & Security → Automation → Safari, then rerun.
+- **Window closed:** rerun with the same cache/report paths; a new dedicated window is opened and successful pages are skipped.
+- **Blocking persists:** the crawler backs off and pauses. Inspect the failed page/report before resuming; do not repeatedly restart or switch sessions to force progress.
+- **Pilot mismatch:** inspect the saved HTML and comparison report. Differences are review candidates, not automatic CSV changes.
+- **Need to keep the Mac awake:** run the command with `caffeinate -i python3 ...`. Keep logs under `.cache/`; do not run another writer against the same cache, report, or state file.
+
+The 2026-09-13 recrawl completed at 19:53 UTC with all 1,627 supplied profile
+URLs cached and parsed successfully. Regular Safari/AppleScript sustained
+fetching after HTTP, Playwright/Chrome, and Safari WebDriver encountered blocking.
+The reusable script handled the final 1,022 fetches, including a corrected capture
+from the initial temporary runner. That stale-page capture was preserved
+separately and refetched; the reusable helper waits for the previous document to
+clear before loading the next URL. The completed cache had no duplicate HTML.
+
+Three comparison candidates remained: Nikolaj Bjørner's displayed name order,
+Frank Wm Tompa's blank citation, and Richard R. Burton's truncated citation.
+The source CSV was unchanged. These results validate this run, not future ACM
+availability. Full HTML, logs, and reports remain local under `.cache/`.
 
 Default cache path:
 
@@ -56,7 +117,9 @@ The ACM cache is keyed by profile URL. Each value contains the full `html`, fetc
 ```json
 {
   "status": "ok",
-  "status_code": 200,
+  "status_code": null,
+  "fetch_method": "safari-applescript",
+  "final_url": "https://awards.acm.org/award-recipients/example",
   "title": "Fellow Name",
   "page_name": "Fellow Name",
   "award_heading": "ACM Fellows",
@@ -68,12 +131,16 @@ The ACM cache is keyed by profile URL. Each value contains the full `html`, fetc
 }
 ```
 
-Other possible `status` values include:
+Safari cannot read HTTP response codes or headers. `status_code` is always `null`
+for Safari entries; known 404 and block pages are detected from HTML. Retry-After
+headers are unavailable, so retries use the conservative backoff described above.
+
+Possible `status` values include:
 
 - `ok`: page fetched and the ACM Fellows award section was parsed.
-- `http_error`: ACM returned an HTTP error.
+- `http_error`: an ACM 404 page was recognized in HTML (HTTP transports can also record actual HTTP errors).
 - `blocked`: ACM returned a Cloudflare/interstitial-style page instead of profile content.
-- `url_error`: DNS/network/connection failure.
+- `url_error`: AppleScript, browser-window, navigation, or loaded-URL validation failure.
 - `timeout`: request timed out.
 - `invalid_url`: URL is not HTTP/HTTPS.
 - `no_name`: page fetched but no page name was parsed.
@@ -86,7 +153,7 @@ When propagating ACM crawl results into `path/to/input.csv`, use only entries wh
 Historical ACM profile crawl notes (April 2026):
 
 - The 2026-04-29 browser/CDP retry resolved all previously cached `blocked` pages.
-- The current report has 1,628 `ok` entries, 0 `blocked` entries, and 11 `http_error` entries.
+- That historical report had 1,628 `ok` entries, 0 `blocked` entries, and 11 `http_error` entries.
 - The 11 `http_error` entries are ACM 404 pages. They are documented in the consuming application's data notes.
 
 ## DBLP Profile Crawler
@@ -244,45 +311,19 @@ The CSRankings crawler defaults are:
 - `--limit-new N` caps uncached requests for one run.
 - `--letters a,b,c` restricts the shard set for testing or targeted refreshes.
 
-## ACM Fellow Playwright Crawler
+## ACM Implementation and Retired Approaches
 
-`scripts/cache_acm_fellow_profiles_playwright.py` is a browser-backed companion to `scripts/cache_acm_fellow_profiles.py`. Use it when direct Python requests return `blocked` pages but the public ACM profile page works in a browser.
+Use `scripts/cache_acm_fellow_profiles_safari.py` for ACM profile fetching.
+`scripts/cache_acm_fellow_profiles.py` supplies the shared parser, cache helpers,
+and report builder. Its legacy HTTP entry point remains for compatibility,
+but direct HTTP was blocked in the September 2026 crawl and is not the
+recommended fetch path.
 
-It uses the same input CSV, cache, report, parser, and report builder:
-
-```text
-path/to/input.csv
-.cache/acm-fellow-profile-cache.json
-.cache/acm-fellow-profile-report.json
-```
-
-Basic commands:
-
-```bash
-python scripts/cache_acm_fellow_profiles_playwright.py --data path/to/input.csv --limit-new 2
-python scripts/cache_acm_fellow_profiles_playwright.py --data path/to/input.csv --retry-status blocked --limit-new 2
-python scripts/cache_acm_fellow_profiles_playwright.py --data path/to/input.csv --headed --retry-status blocked --limit-new 2
-python scripts/cache_acm_fellow_profiles_playwright.py --data path/to/input.csv --headed --channel chrome --retry-status blocked --limit-new 2
-python scripts/cache_acm_fellow_profiles_playwright.py --data path/to/input.csv --headed --channel chrome --pause-before-read --retry-status blocked --limit-new 1
-python scripts/cache_acm_fellow_profiles_playwright.py --data path/to/input.csv --cdp-url http://127.0.0.1:9222 --retry-status blocked --limit-new 2
-python scripts/cache_acm_fellow_profiles_playwright.py --data path/to/input.csv --cdp-url http://127.0.0.1:9222 --retry-status blocked --delay 4 --delay-jitter 2 --batch-size 25 --batch-size-jitter 5 --batch-pause 90 --batch-pause-jitter 30
-python scripts/cache_acm_fellow_profiles_playwright.py --data path/to/input.csv --cdp-url http://127.0.0.1:9222 --retry-status blocked --delay 4 --delay-jitter 2 --batch-size 25 --batch-size-jitter 5 --batch-pause 90 --batch-pause-jitter 30 --limit-batches 2
-```
-
-The script uses a persistent Chromium profile by default:
-
-```text
-.cache/playwright-acm-profile
-```
-
-Use `--headed` when ACM requires interactive browser state. If a manual challenge or cookie prompt appears, use `--pause-before-read`, complete the challenge in the opened browser window, then press Enter in the terminal so the script caches the final page HTML. Subsequent runs reuse the same local profile. `--channel chrome` uses an installed Chrome browser instead of the bundled Playwright Chromium when available. Keep the profile under `.cache/` and do not commit it.
-
-If ACM works in a manually launched Chrome profile, connect to it over CDP:
-
-```bash
-open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir="$PWD/.cache/chrome-acm-cdp"
-python scripts/cache_acm_fellow_profiles_playwright.py --data path/to/input.csv --cdp-url http://127.0.0.1:9222 --retry-status blocked --limit-new 2
-```
+The ACM Playwright crawler was removed after repeated blocking with regular
+Chrome and incognito sessions. Safari WebDriver also failed to sustain fetching.
+The working approach uses regular Safari through AppleScript; it needs neither
+Playwright nor WebDriver. The April 2026 Chrome/CDP result recorded earlier is historical
+provenance, not an installation or retry recommendation.
 
 ## Google Scholar Profile Crawler
 
@@ -480,16 +521,11 @@ Google Scholar default behavior is therefore:
 
 Because the Scholar crawler now requires full-page cache entries, older metadata-only entries are counted as `incomplete_cached_profiles` in the report and will be fetched again on a normal resume unless capped by `--limit-new`.
 
-The ACM Fellow Playwright crawler uses lighter defaults (the HTTP variant only supports the base delay, batch size, and batch pause):
-
-- `--delay` defaults to `2.0` seconds between uncached requests.
-- `--delay-jitter` defaults to `0.0`; when set, the actual sleep is randomized by plus/minus that many seconds and clamped at zero.
-- `--batch-size` defaults to `50` uncached requests.
-- `--batch-size-jitter` defaults to `0`; when set, each batch target is randomized by plus/minus that many requests and clamped to at least 1.
-- `--batch-pause` defaults to `60.0` seconds after each batch.
-- `--batch-pause-jitter` defaults to `0.0`; when set, the actual cooldown is randomized by plus/minus that many seconds and clamped at zero.
-- `--limit-new N` caps uncached requests for one run.
-- `--limit-batches N` caps completed batches for one run.
+The recommended ACM Safari defaults and retry behavior are documented in
+[Pacing, validation, and progress](#pacing-validation-and-progress). Its delay and
+batch-pause jitter are symmetric (+/-), while retry jitter adds only positive time.
+The legacy HTTP ACM entry point retains 25-profile batches with 60–90 second
+pauses and a 2-second per-page delay; use Safari for current fetching.
 
 The DBLP profile crawler uses plain HTTP by default and adds randomized pacing:
 
