@@ -18,24 +18,84 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import html
 import json
 import random
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import date
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
 
 CRAWLER_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CACHE = CRAWLER_ROOT / ".cache" / "acm-fellow-profile-cache.json"
-DEFAULT_REPORT = CRAWLER_ROOT / ".cache" / "acm-fellow-profile-report.json"
+
+
+def parse_crawl_date(value: str) -> str:
+    try:
+        if date.fromisoformat(value).isoformat() != value:
+            raise ValueError
+    except ValueError:
+        raise argparse.ArgumentTypeError("crawl date must be a valid YYYY-MM-DD date") from None
+    return value
+
+
+def crawl_path(kind: str, crawl_date: str) -> Path:
+    return CRAWLER_ROOT / ".cache" / f"acm-fellow-profile-{kind}-{crawl_date}.json"
+
+
+def manifest_path(cache: Path, crawl_date: str) -> Path:
+    if cache.resolve() == crawl_path("cache", crawl_date).resolve():
+        return crawl_path("manifest", crawl_date)
+    return cache.with_suffix(".manifest.json")
+
+
+def ensure_manifest(args) -> dict[str, Any]:
+    """Bind a crawl to an input snapshot; comparisons may use a different input."""
+    path = manifest_path(args.cache, args.crawl_date)
+    artifacts = {key: str(getattr(args, key).resolve()) for key in ("cache", "report", "state") if hasattr(args, key)}
+    if path.resolve() in {args.data.resolve(), *(Path(p) for p in artifacts.values())}:
+        raise ValueError("manifest, input, and output paths must be distinct")
+    digest = hashlib.sha256(args.data.read_bytes()).hexdigest()
+    if path.exists():
+        manifest = load_json(path, {})
+        if (manifest.get("crawl_date") != args.crawl_date
+                or manifest.get("input", {}).get("sha256") != digest
+                or manifest.get("artifacts", {}).get("cache") != artifacts["cache"]):
+            raise ValueError("Crawl manifest does not match the date, input checksum, or cache path. Resume with the original input snapshot, use a new crawl, or use compare_acm_fellow_profiles.py for another input.")
+        if Path(manifest["input"]["path"]).resolve() in {Path(p) for p in artifacts.values()}:
+            raise ValueError("Crawl outputs must not overwrite the registered input snapshot.")
+        return manifest
+    manifest = {
+        "schema_version": 1, "crawl_date": args.crawl_date,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "input": {"path": str(args.data.resolve()), "sha256": digest},
+        "artifacts": artifacts,
+    }
+    if args.cache.exists():
+        manifest["initial_cache_sha256"] = hashlib.sha256(args.cache.read_bytes()).hexdigest()
+    atomic_write_json(path, manifest)
+    return manifest
+
+
+def latest_attempt(entry: dict[str, Any]) -> dict[str, Any]:
+    return entry.get("last_attempt") or entry
+
+
+def record_attempt(cache: dict[str, Any], url: str, entry: dict[str, Any]) -> None:
+    previous = cache.get(url, {})
+    if previous.get("status") == "ok" and previous.get("html") and entry.get("status") != "ok":
+        cache[url] = {**previous, "last_attempt": entry}
+    else:
+        cache[url] = entry
 
 SUFFIXES = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv"}
 PARTICLES = {"al", "bin", "da", "de", "del", "den", "der", "di", "du", "la", "le", "van", "von"}
@@ -52,6 +112,7 @@ class AcmProfile:
 
 
 class AcmProfileParser(HTMLParser):
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.stack: list[tuple[str, dict[str, str]]] = []
@@ -66,6 +127,10 @@ class AcmProfileParser(HTMLParser):
         self._field_depth: int | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self.VOID_TAGS:
+            if tag in {"br", "hr", "wbr"}:
+                self.handle_data(" ")
+            return
         attr_dict = {key: value or "" for key, value in attrs}
         self.stack.append((tag, attr_dict))
 
@@ -89,6 +154,13 @@ class AcmProfileParser(HTMLParser):
                 self._field_depth = len(self.stack)
 
     def handle_endtag(self, tag: str) -> None:
+        if tag in self.VOID_TAGS:
+            return
+        # Ignore stray closing tags; unwind to the matching open element.
+        position = next((i for i in range(len(self.stack) - 1, -1, -1) if self.stack[i][0] == tag), None)
+        if position is None:
+            return
+        del self.stack[position + 1:]
         if tag == "title":
             self._in_title = False
 
@@ -137,15 +209,21 @@ class AcmProfileParser(HTMLParser):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True, help="Input CSV containing name and acm_fellow_profile.")
-    parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="JSON cache path.")
-    parser.add_argument("--report", type=Path, default=DEFAULT_REPORT, help="JSON report path.")
+    parser.add_argument("--crawl-date", type=parse_crawl_date, required=True, help="Crawl start date (YYYY-MM-DD); keep the same date when resuming.")
+    parser.add_argument("--cache", type=Path, help="Override the dated JSON cache path.")
+    parser.add_argument("--report", type=Path, help="Override the dated JSON report path.")
     parser.add_argument("--delay", type=float, default=2.0, help="Seconds to wait between uncached requests.")
     parser.add_argument("--batch-size", type=int, default=25, help="Uncached requests per batch.")
     parser.add_argument("--batch-pause", type=float, default=75.0, help="Seconds to pause after each batch.")
     parser.add_argument("--batch-pause-jitter", type=float, default=15.0, help="Random +/- seconds around --batch-pause. Sleep is clamped at zero.")
     parser.add_argument("--limit-new", type=int, default=None, help="Optional cap on uncached requests this run.")
     parser.add_argument("--refresh", action="store_true", help="Refetch URLs even when cached.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.cache = args.cache or crawl_path("cache", args.crawl_date)
+    args.report = args.report or crawl_path("report", args.crawl_date)
+    if len({path.resolve() for path in (args.data, args.cache, args.report)}) != 3:
+        parser.error("input, cache, and report paths must be distinct")
+    return args
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -163,7 +241,11 @@ def load_json(path: Path, default: Any) -> Any:
 
 def load_rows(data_path: Path) -> list[dict[str, str]]:
     with data_path.open(newline="", encoding="utf-8") as file:
-        return list(csv.DictReader(file))
+        reader = csv.DictReader(file)
+        fields = set(reader.fieldnames or [])
+        if "name" not in fields or not fields.intersection({"acm_fellow_profile", "ACM Fellow Profile"}):
+            raise ValueError("Input CSV requires name and acm_fellow_profile columns.")
+        return list(reader)
 
 
 def row_name(row: dict[str, str]) -> str:
@@ -235,8 +317,9 @@ def split_location_year(value: str) -> tuple[str, str]:
 
 
 def normalize_tokens(value: str) -> list[str]:
-    text = clean_person_name(value).lower()
-    text = re.sub(r"[^a-z0-9\s.-]", " ", text)
+    text = clean_person_name(value).casefold().translate(str.maketrans({"ø": "o", "ł": "l", "đ": "d", "æ": "ae", "œ": "oe"}))
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+    text = re.sub(r"[^\w\s.-]|_", " ", text)
     tokens = []
     for token in re.split(r"\s+", text):
         token = token.strip(".-")
@@ -258,18 +341,19 @@ def compatible_name(expected: str, observed: str) -> bool:
     if not expected_tokens or not observed_tokens:
         return False
 
+    if "".join(expected_tokens) == "".join(observed_tokens):
+        return True
+    if sorted(expected_tokens) == sorted(observed_tokens):
+        return True
     if last_name(expected_tokens) == last_name(observed_tokens):
         expected_first = expected_tokens[0]
         observed_first = observed_tokens[0]
         return (
             expected_first == observed_first
-            or expected_first[:1] == observed_first[:1]
-            or any(token in observed_tokens for token in expected_tokens[:-1] if len(token) > 1)
+            or ((len(expected_first) == 1 or len(observed_first) == 1)
+                and expected_first[:1] == observed_first[:1])
         )
-
-    expected_set = {token for token in expected_tokens if len(token) > 1}
-    observed_set = {token for token in observed_tokens if len(token) > 1}
-    return len(expected_set & observed_set) >= 2
+    return False
 
 
 def decode_body(body: bytes, headers: Any) -> str:
@@ -399,6 +483,7 @@ def build_report(profiles: list[AcmProfile], cache: dict[str, Any]) -> dict[str,
             "location_match": parsed_location == profile.location if status == "ok" else None,
             "citation_match": normalize_space(parsed_citation) == normalize_space(profile.citation) if status == "ok" else None,
             "fetched_at": cached.get("fetched_at"),
+            "last_attempt_status": latest_attempt(cached).get("status"),
         }
         entries.append(entry)
         status_counts[status] = status_counts.get(status, 0) + 1
@@ -409,6 +494,7 @@ def build_report(profiles: list[AcmProfile], cache: dict[str, Any]) -> dict[str,
         if entry["status"] != "missing"
         and (
             entry["status"] != "ok"
+            or entry.get("last_attempt_status") != "ok"
             or entry["name_match"] is False
             or entry["year_match"] is False
             or entry["location_match"] is False
@@ -431,6 +517,11 @@ def main() -> int:
     rows = load_rows(args.data)
     profiles = unique_profiles(rows)
     cache: dict[str, Any] = load_json(args.cache, {})
+    try:
+        ensure_manifest(args)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 1
 
     new_requests = 0
     batch_requests = 0
@@ -453,7 +544,7 @@ def main() -> int:
             batch_requests = 0
 
         print(f"[{position}/{len(profiles)}] fetching {profile.name}: {profile.url}", flush=True)
-        cache[profile.url] = fetch_profile(profile.url)
+        record_attempt(cache, profile.url, fetch_profile(profile.url))
         new_requests += 1
         batch_requests += 1
 

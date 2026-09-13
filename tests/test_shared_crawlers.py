@@ -65,6 +65,8 @@ class SharedCrawlerTests(unittest.TestCase):
             argv = [module.__file__]
             if module is not CSRANKINGS:
                 argv += ["--data", str(self.work / "app.csv")]
+            if module in (ACM, SAFARI):
+                argv += ["--crawl-date", "2026-09-13"]
             with patch.object(sys, "argv", argv):
                 args = module.parse_args()
             self.assertTrue(args.report.is_relative_to(ROOT / ".cache"))
@@ -73,11 +75,10 @@ class SharedCrawlerTests(unittest.TestCase):
             if module is SCHOLAR:
                 self.assertIsNone(args.output)
             if module is SAFARI:
-                self.assertEqual(args.cache, ACM.DEFAULT_CACHE)
+                self.assertEqual(args.cache, ACM.crawl_path("cache", "2026-09-13"))
 
     def test_two_applications_reuse_profiles_and_preserve_other_cached_urls(self):
         cases = [
-            (ACM, "acm_fellow_profile", "https://awards.acm.org/award-recipients/example"),
             (DBLP, "dblp_profile", "https://dblp.org/pid/example"),
             (SCHOLAR, "google_scholar_profile", "https://scholar.google.com/citations?user=example"),
         ]
@@ -106,6 +107,37 @@ class SharedCrawlerTests(unittest.TestCase):
                 self.assertEqual(set(json.loads(cache.read_text())), {url, url + "2"})
                 self.assertEqual(json.loads(report.read_text())["total_profiles"], 2)
                 self.assertEqual((first.read_bytes(), second.read_bytes()), before)
+
+    def test_acm_requires_a_valid_date_even_with_path_overrides(self):
+        for module in (ACM, SAFARI):
+            for value in (None, "2026-02-30", "20260913", "2026-9-13", "../cache"):
+                argv = [module.__file__, "--data", "input.csv", "--cache", "custom.json"]
+                if value is not None:
+                    argv += ["--crawl-date", value]
+                with self.subTest(module=module.__name__, date=value), patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        module.parse_args()
+                    self.assertEqual(error.exception.code, 2)
+
+    def test_acm_dates_isolate_runs_and_preserve_explicit_overrides(self):
+        for module in (ACM, SAFARI):
+            for day in ("2026-09-13", "2026-09-14", "2024-02-29"):
+                argv = [module.__file__, "--data", "input.csv", "--crawl-date", day]
+                with patch.object(sys, "argv", argv):
+                    args = module.parse_args()
+                self.assertEqual(args.cache, ROOT / ".cache" / f"acm-fellow-profile-cache-{day}.json")
+                self.assertEqual(args.report, ROOT / ".cache" / f"acm-fellow-profile-report-{day}.json")
+                if module is SAFARI:
+                    self.assertEqual(args.state, ROOT / ".cache" / f"acm-fellow-profile-state-{day}.json")
+                overrides = ["--cache", "custom-cache.json", "--report", "custom-report.json"]
+                if module is SAFARI:
+                    overrides += ["--state", "custom-state.json"]
+                with patch.object(sys, "argv", argv + overrides):
+                    custom = module.parse_args()
+                self.assertEqual(custom.cache, Path("custom-cache.json"))
+                self.assertEqual(custom.report, Path("custom-report.json"))
+                if module is SAFARI:
+                    self.assertEqual(custom.state, Path("custom-state.json"))
 
     def test_scholar_export_is_explicit_and_can_be_suppressed(self):
         url = "https://scholar.google.com/citations?user=example"

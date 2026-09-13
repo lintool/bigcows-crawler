@@ -18,8 +18,8 @@ normal Safari browsing session. Playwright and Chrome are not required.
 
 The HTTP crawlers for other sources also use only the standard library. ACM
 fetching uses the Safari script; the original ACM module retains shared parsing
-and cache helpers plus its legacy HTTP entry point. The unsuccessful ACM
-Playwright transport has been removed.
+and cache helpers plus its legacy HTTP entry point. Use Safari for ACM fetching;
+the HTTP entry point can encounter blocking.
 
 ## Commands
 
@@ -29,14 +29,15 @@ working directory. Default cache/report paths resolve from the crawler repositor
 even when invoked from another directory.
 
 ```bash
-python3 scripts/cache_acm_fellow_profiles_safari.py --data /path/to/people.csv
+python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data /path/to/people.csv
 python3 scripts/cache_dblp_profiles.py --data /path/to/people.csv
 python3 scripts/cache_google_scholar_profiles.py --data /path/to/people.csv
 python3 scripts/cache_csrankings.py
 ```
 
 The profile crawlers require `--data` and never choose an application's dataset
-implicitly. CSV columns are:
+implicitly. ACM also requires `--crawl-date YYYY-MM-DD`; replace the example date
+with the start date of your new crawl. CSV columns are:
 
 | Crawler | Profile URL column | Other fields used |
 | --- | --- | --- |
@@ -55,9 +56,10 @@ All default crawl artifacts live under this repository's Git-ignored `.cache/`:
 
 ```text
 .cache/
-  acm-fellow-profile-cache.json
-  acm-fellow-profile-report.json
-  acm-fellow-profile-cache.status.json
+  acm-fellow-profile-cache-YYYY-MM-DD.json
+  acm-fellow-profile-report-YYYY-MM-DD.json
+  acm-fellow-profile-state-YYYY-MM-DD.json
+  acm-fellow-profile-manifest-YYYY-MM-DD.json
   dblp-profile-cache.json
   dblp-profile-report.json
   google-scholar-profile-cache.json
@@ -68,14 +70,17 @@ All default crawl artifacts live under this repository's Git-ignored `.cache/`:
 
 Profile caches are JSON objects keyed by URL, containing fetched HTML, parsed
 fields, status, and timestamps. Safari reuses the existing ACM URL-keyed cache format and shared parser.
-Different applications reuse cached URLs; each report describes that run's input.
+Different applications can consume the same captured profiles. ACM crawl manifests
+bind each crawl to one input checksum; use the comparison command for another
+application's CSV, or start a separate crawl for different fetch inputs.
+Each report describes that run's input.
 Default reports are replaced on subsequent runs. Use an application-specific
 `--report .cache/my-app/scholar-report.json` when retaining separate reports.
 
 Run writers to the same cache sequentially: the scripts do not lock shared caches
-against simultaneous processes. Use separate `--cache` paths (or `--cache-dir`
-for CSRankings) if independent concurrent runs are needed. Keep overrides under
-`.cache/` to keep crawl artifacts out of Git.
+against simultaneous processes. Use separate cache, report, and state paths (or
+`--cache-dir` for CSRankings) if independent concurrent runs are needed. Keep
+overrides under `.cache/` to keep crawl artifacts out of Git.
 
 Scholar writes no CSV by default. Export to an application only when requested:
 
@@ -96,18 +101,28 @@ pause every 25 fetch attempts. It checks the first five fetched profiles against
 the input name/year before continuing. Persistent blocking or browser errors
 pause the run with a nonzero exit code; details are saved in the progress JSON.
 
-Use a **new cache path** for a fresh, resumable crawl that preserves the old cache:
+Use a **new crawl date** for a fresh, resumable crawl that preserves earlier runs:
 
 ```bash
-python3 scripts/cache_acm_fellow_profiles_safari.py --data /path/to/people.csv --cache .cache/acm-refresh/cache.json --report .cache/acm-refresh/report.json
+python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data /path/to/people.csv
 ```
 
-Repeat the same command to resume. Successful HTML is reused, transient failures
+Repeat the same command with the same input contents to resume. Successful HTML is reused, transient failures
 are retried, and progress is saved after every attempt. `--limit-new 5` restricts
 a trial to five profiles. `--refresh` instead refetches all selected URLs and
-replaces their cache entries; do not repeat `--refresh` to resume an interrupted
-run. Choose a new directory for each independent fresh crawl. Keep the input CSV
-stable during a run, or use a local snapshot under `.cache/`.
+replaces their cache entries on success; a failed attempt preserves previously
+successful HTML in that entry and records the failure as `last_attempt`.
+Do not repeat `--refresh` to resume an interrupted
+run. The date is the crawl's start date; keep it when resuming across midnight.
+For independent runs on the same date, supply distinct `--cache`, `--report`, and
+`--state` overrides under `.cache/`. Overrides change only the specified paths;
+unspecified paths still use the selected date. Keep the input CSV stable during
+a run, or supply a snapshot named `acm-fellow-profile-input-YYYY-MM-DD.csv`.
+Capture console output as `acm-fellow-profile-log-YYYY-MM-DD.txt` if needed.
+Input snapshots and log files are managed by the caller, not created automatically.
+The manifest is created automatically and records the crawl date, input checksum,
+and artifact paths. Reusing a crawl with changed input contents is rejected;
+resuming with an identical snapshot at another path is allowed.
 
 Safari saves the loaded HTML, parsed fields, timestamps, final URL, and
 `fetch_method: safari-applescript`. It does **not** expose HTTP status codes or
@@ -115,19 +130,36 @@ response headers: `status_code` is `null`, and recognizable error pages are
 classified from HTML. `--refresh` controls our local cache, not Safari's HTTP
 cache; Safari may reuse/revalidate browser-cached responses.
 
-The 2026-09-13 recrawl completed with all 1,627 supplied profile URLs cached and
-parsed; the reusable Safari script handled the final 1,022 fetches. Three field
-differences remained for review, and the CSV was unchanged. Safari/AppleScript
-sustained fetching after HTTP, Playwright, and Safari WebDriver encountered
-blocking. This successful run does not guarantee future ACM availability.
-See [the reference](README_FOR_AGENTS.md) for retry controls and troubleshooting.
+There is no undated default or automatic latest-crawl selection. Select the
+intended `--crawl-date` for later comparisons. An explicit `--cache` overrides the
+path but does not replace the required date. Keep
+application-specific crawl history and reviewed data corrections in the consuming
+repository. See [the reference](README_FOR_AGENTS.md) for retry controls,
+report interpretation, and troubleshooting.
 
 ## Verification
 
-Cached results are reused by default. `--refresh` explicitly refetches them;
-`--limit-new N` caps requests. `--limit-new 0` rebuilds cache/report output without
-network requests. Safari does not open a window in this mode.
-Scholar may refetch incomplete cache entries lacking HTML. See
+For a read-only audit against an existing crawl, use:
+
+```bash
+python3 scripts/compare_acm_fellow_profiles.py --crawl-date 2026-09-13 --data /path/to/people.csv
+```
+
+This reparses captured HTML, reports exact field differences, name compatibility,
+blank and missing URLs, and duplicates as JSON on stdout. It can compare a changed
+input without modifying any crawl files. `--output PATH` optionally writes a new
+comparison file and refuses to overwrite an existing file or crawl artifact.
+The name matcher accepts initials and Unicode variants but cannot establish
+identity by itself; review source HTML and preserve better existing CSV values.
+
+The crawler's `--limit-new 0` mode still writes cache, report, manifest, and progress
+output for the original input without opening Safari. It uses stored parsed fields
+and is not the read-only audit command.
+
+Successful ACM entries with HTML are reused by default; transient failures and
+incomplete `ok` entries are retried. `--refresh` explicitly refetches selected URLs.
+For Safari, `--limit-new N` caps distinct profiles, not retry attempts. Scholar may
+also refetch incomplete cache entries lacking HTML. See
 [README_FOR_AGENTS.md](README_FOR_AGENTS.md) for retries, pacing, parsers, browser
 sessions, and report schemas.
 
