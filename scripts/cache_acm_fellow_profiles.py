@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Cache ACM Fellow profile pages and report parsed profile fields.
 
+For the recommended macOS transport, run cache_acm_fellow_profiles_safari.py.
+This module retains the shared parser/cache helpers and the HTTP alternative.
+
 The script is intentionally conservative:
 
 - cached URLs, including cached HTML pages, are never fetched again unless --refresh is passed
 - each uncached request waits --delay seconds before the next one
-- every --batch-size uncached requests, the script pauses for --batch-pause seconds
+- every --batch-size uncached requests, the script pauses for --batch-pause seconds plus/minus --batch-pause-jitter
 - cache and report files are written after every request so runs can be resumed
 
 The script does not modify the app data files. It only writes validation output.
@@ -17,6 +20,7 @@ import argparse
 import csv
 import html
 import json
+import random
 import re
 import sys
 import time
@@ -136,8 +140,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="JSON cache path.")
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT, help="JSON report path.")
     parser.add_argument("--delay", type=float, default=2.0, help="Seconds to wait between uncached requests.")
-    parser.add_argument("--batch-size", type=int, default=50, help="Uncached requests per batch.")
-    parser.add_argument("--batch-pause", type=float, default=60.0, help="Seconds to pause after each batch.")
+    parser.add_argument("--batch-size", type=int, default=25, help="Uncached requests per batch.")
+    parser.add_argument("--batch-pause", type=float, default=75.0, help="Seconds to pause after each batch.")
+    parser.add_argument("--batch-pause-jitter", type=float, default=15.0, help="Random +/- seconds around --batch-pause. Sleep is clamped at zero.")
     parser.add_argument("--limit-new", type=int, default=None, help="Optional cap on uncached requests this run.")
     parser.add_argument("--refresh", action="store_true", help="Refetch URLs even when cached.")
     return parser.parse_args()
@@ -438,8 +443,13 @@ def main() -> int:
             break
 
         if batch_requests >= args.batch_size:
-            print(f"Pausing {args.batch_pause:.0f}s after {batch_requests} uncached requests.", flush=True)
-            time.sleep(args.batch_pause)
+            jitter = max(0.0, args.batch_pause_jitter)
+            pause = (
+                max(0.0, args.batch_pause + random.uniform(-jitter, jitter))
+                if args.batch_pause > 0 else 0.0
+            )
+            print(f"Pausing {pause:.1f}s after {batch_requests} uncached requests.", flush=True)
+            time.sleep(pause)
             batch_requests = 0
 
         print(f"[{position}/{len(profiles)}] fetching {profile.name}: {profile.url}", flush=True)
