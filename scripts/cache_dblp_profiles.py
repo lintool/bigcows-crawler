@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Cache DBLP profile pages and report parsed profile titles.
 
 The script is intentionally conservative:

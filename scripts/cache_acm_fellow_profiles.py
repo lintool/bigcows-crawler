@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Cache ACM Fellow profile pages and report parsed profile fields.
 
 For the recommended macOS transport, run cache_acm_fellow_profiles_safari.py.
@@ -143,9 +143,9 @@ class AcmProfile:
     index: int
     name: str
     url: str
-    year: str = ""
-    location: str = ""
-    citation: str = ""
+    year: str | None = None
+    location: str | None = None
+    citation: str | None = None
 
 
 class AcmProfileParser(HTMLParser):
@@ -311,6 +311,11 @@ def row_value(row: dict[str, str], *keys: str) -> str:
     return ""
 
 
+def optional_row_value(row: dict[str, str], *keys: str) -> str | None:
+    """An absent column is unrequested; an explicit blank remains comparable."""
+    return row_value(row, *keys) if any(key in row for key in keys) else None
+
+
 def unique_profiles(rows: list[dict[str, str]]) -> list[AcmProfile]:
     seen: set[str] = set()
     profiles: list[AcmProfile] = []
@@ -324,9 +329,9 @@ def unique_profiles(rows: list[dict[str, str]]) -> list[AcmProfile]:
                 index=row_number,
                 name=row_name(row),
                 url=url,
-                year=row_value(row, "Year", "year"),
-                location=row_value(row, "Location", "location"),
-                citation=row_value(row, "Citation", "citation"),
+                year=optional_row_value(row, "Year", "year"),
+                location=optional_row_value(row, "Location", "location"),
+                citation=optional_row_value(row, "Citation", "citation"),
             )
         )
     return profiles
@@ -421,10 +426,16 @@ def looks_blocked(body: str) -> bool:
         "cloudflare ray id",
         "enable_cookies",
         "our systems have detected unusual traffic",
+        "too many requests",
     ]
     if any(marker in text for marker in markers):
         return True
-    return "cloudflareapps" in text and "awards-winners__citation" not in text
+    if "cloudflareapps" in text and "awards-winners__citation" not in text:
+        # The generic Cloudflare integration is also present on legitimate
+        # pages. Recognize the legacy recipient layout before rejecting it.
+        from acm_turing_legacy import parse_legacy_turing
+        return parse_legacy_turing(body) is None
+    return False
 
 
 def parse_profile_html(body: str, award: str = "fellows") -> dict[str, str]:
@@ -439,6 +450,24 @@ def parse_profile_html(body: str, award: str = "fellows") -> dict[str, str]:
     parsed["page_name"] = clean_person_name(parsed.get("page_name", ""))
     parsed["title"] = clean_person_name(parsed.get("title", ""))
     return parsed
+
+
+def classify_profile_html(body: str, award: str = "fellows") -> dict[str, str]:
+    """Classify captured HTML identically during fetching and later audits."""
+    parsed = parse_profile_html(body, award)
+    if not body:
+        status = "missing_html"
+    elif looks_blocked(body):
+        status = "blocked"
+    elif "404 - your page could not be found" in body.lower():
+        status = "http_error"
+    elif not parsed["page_name"]:
+        status = "no_name"
+    elif not parsed["award_heading"]:
+        status = "no_turing_award" if award == "turing" else "no_fellow_award"
+    else:
+        status = "ok"
+    return {**parsed, "status": status}
 
 
 def fetch_profile(url: str) -> dict[str, Any]:
@@ -480,18 +509,7 @@ def fetch_profile(url: str) -> dict[str, Any]:
     except TimeoutError:
         return {"status": "timeout", "html": "", "fetched_at": fetched_at}
 
-    if looks_blocked(body):
-        return {"status": "blocked", "status_code": status_code, "html": body, "fetched_at": fetched_at}
-
-    parsed = parse_profile_html(body)
-    if not parsed.get("page_name"):
-        status = "no_name"
-    elif not parsed.get("award_heading"):
-        status = "no_fellow_award"
-    else:
-        status = "ok"
-
-    return {"status": status, "status_code": status_code, "html": body, "fetched_at": fetched_at, **parsed}
+    return {"status_code": status_code, "html": body, "fetched_at": fetched_at, **classify_profile_html(body)}
 
 
 def build_report(profiles: list[AcmProfile], cache: dict[str, Any]) -> dict[str, Any]:
@@ -535,9 +553,9 @@ def build_report(profiles: list[AcmProfile], cache: dict[str, Any]) -> dict[str,
             "location": parsed_location,
             "citation": parsed_citation,
             "name_match": compatible_name(profile.name, page_name) if status == "ok" else None,
-            "year_match": parsed_year == profile.year if status == "ok" else None,
-            "location_match": parsed_location == profile.location if status == "ok" else None,
-            "citation_match": normalize_space(parsed_citation) == normalize_space(profile.citation) if status == "ok" else None,
+            "year_match": parsed_year == profile.year if status == "ok" and profile.year is not None else None,
+            "location_match": parsed_location == profile.location if status == "ok" and profile.location is not None else None,
+            "citation_match": normalize_space(parsed_citation) == normalize_space(profile.citation) if status == "ok" and profile.citation is not None else None,
             "fetched_at": cached.get("fetched_at"),
             "last_attempt_status": latest_attempt(cached).get("status"),
         }
