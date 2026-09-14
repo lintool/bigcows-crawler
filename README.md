@@ -6,7 +6,7 @@ consume cached results or explicitly requested exports.
 
 ## Setup
 
-Use Python 3.10 or newer. The recommended ACM profile crawler uses **regular
+Use Python 3.10 or newer, available as `python`. The recommended ACM profile crawler uses **regular
 Safari through AppleScript on macOS**, with only the Python standard library.
 Allow the launching terminal/application to control Safari if macOS prompts.
 Safari's “Allow remote automation” and “Allow JavaScript from Apple Events”
@@ -29,11 +29,11 @@ working directory. Default cache/report paths resolve from the crawler repositor
 even when invoked from another directory.
 
 ```bash
-python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data /path/to/people.csv
-python3 scripts/cache_acm_fellow_profiles_safari.py --award turing --crawl-date 2026-09-14 --data /path/to/turing-winners.csv
-python3 scripts/cache_dblp_profiles.py --data /path/to/people.csv
-python3 scripts/cache_google_scholar_profiles.py --data /path/to/people.csv
-python3 scripts/cache_csrankings.py
+python scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data /path/to/people.csv
+python scripts/cache_acm_fellow_profiles_safari.py --award turing --crawl-date 2026-09-14 --data /path/to/turing-winners.csv
+python scripts/cache_dblp_profiles.py --data /path/to/people.csv
+python scripts/cache_google_scholar_profiles.py --data /path/to/people.csv
+python scripts/cache_csrankings.py
 ```
 
 The profile crawlers require `--data` and never choose an application's dataset
@@ -45,6 +45,9 @@ with the start date of your new crawl. CSV columns are:
 | ACM (Safari) | `acm_fellow_profile` | `name`; optional `year`, `location`, `citation` for comparisons |
 | DBLP | `dblp_profile` | `name`; optional `acm_fellow_profile` for report context |
 | Google Scholar | `google_scholar_profile` | `name`; optional `acm_fellow_profile` for report context |
+
+For ACM comparisons, omitted optional columns are skipped. Present but blank
+cells are compared, so values available for enrichment remain visible.
 
 Blank profile URLs are skipped, duplicate URLs are fetched once, and unrelated
 columns are ignored. Legacy title-cased URL columns remain supported. Scholar
@@ -90,7 +93,7 @@ overrides under `.cache/` to keep crawl artifacts out of Git.
 Scholar writes no CSV by default. Export to an application only when requested:
 
 ```bash
-python3 scripts/cache_google_scholar_profiles.py --data ../cs-big-cows/data/acm_fellows.csv --output ../cs-big-cows/data/google_scholar_profiles.csv --limit-new 0
+python scripts/cache_google_scholar_profiles.py --data ../cs-big-cows/data/acm_fellows.csv --output ../cs-big-cows/data/google_scholar_profiles.csv --limit-new 0
 ```
 
 Existing rows in the selected export are retained and enriched from cache;
@@ -110,11 +113,12 @@ the older `amturing.acm.org` recipient layout. The URL column remains
 Both awards can use the same `.cache/` directory and start date. Their filenames
 have different prefixes, so their inputs, manifests, cache, report, and progress
 remain separate. Start with an empty Turing cache for a fresh crawl; do not seed
-it from the Fellows cache. Add `--prepare-only` to register the input and write
-an empty cache/report plus `prepared` state without opening Safari or fetching:
+it from the Fellows cache. With a new cache, `--prepare-only` registers the input,
+writes an empty cache and a report listing missing profiles, and saves `prepared`
+state without opening Safari or fetching. Existing captures are preserved:
 
 ```bash
-python3 scripts/cache_acm_fellow_profiles_safari.py --award turing --crawl-date 2026-09-14 --data /path/to/stable-input.csv --prepare-only
+python scripts/cache_acm_fellow_profiles_safari.py --award turing --crawl-date 2026-09-14 --data /path/to/stable-input.csv --prepare-only
 ```
 
 Remove `--prepare-only` to start. Retain the same date and input snapshot to
@@ -136,7 +140,7 @@ pause the run with a nonzero exit code; details are saved in the progress JSON.
 Use a **new crawl date** for a fresh, resumable crawl that preserves earlier runs:
 
 ```bash
-python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data /path/to/people.csv
+python scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data /path/to/people.csv
 ```
 
 Repeat the same command with the same input contents to resume. Successful HTML is reused, transient failures
@@ -176,7 +180,7 @@ report interpretation, and troubleshooting.
 For a read-only audit against an existing crawl, use:
 
 ```bash
-python3 scripts/compare_acm_fellow_profiles.py --crawl-date 2026-09-13 --data /path/to/people.csv
+python scripts/compare_acm_fellow_profiles.py --crawl-date 2026-09-13 --data /path/to/people.csv
 ```
 
 This reparses captured HTML, reports exact field differences, name compatibility,
@@ -200,5 +204,5 @@ sessions, and report schemas.
 Run offline regression tests:
 
 ```bash
-python3 -B -m unittest discover -s tests -v
+python -B -m unittest discover -s tests -v
 ```

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Compare a CSV with captured ACM HTML without fetching or modifying crawl files."""
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import sys
 
 from cache_acm_fellow_profiles import (
     compatible_name, crawl_path, latest_attempt, load_json, load_rows,
-    looks_blocked, manifest_path, parse_crawl_date, parse_profile_html, row_value,
+    classify_profile_html, manifest_path, parse_crawl_date, row_value, optional_row_value,
     AWARD_PREFIXES,
 )
 
@@ -31,22 +31,12 @@ def compare_rows(rows, cache, award='fellows'):
             entries.append({**result, 'status': 'missing'})
             continue
         body = cached.get('html') or ''
-        parsed = parse_profile_html(body, award)
-        status = 'ok'
-        if not body:
-            status = 'missing_html'
-        elif looks_blocked(body) or 'too many requests' in body.lower():
-            status = 'blocked'
-        elif '404 - Your Page Could Not Be Found' in body:
-            status = 'http_error'
-        elif not parsed['page_name']:
-            status = 'no_name'
-        elif not parsed['award_heading']:
-            status = 'no_turing_award' if award == 'turing' else 'no_fellow_award'
+        parsed = classify_profile_html(body, award)
+        status = parsed.pop('status')
         differences = {}
         for column, key in (('name', 'page_name'), ('year', 'year'), ('location', 'location'), ('citation', 'citation')):
-            expected = row.get('name', '') if column == 'name' else row_value(row, column.title(), column)
-            if expected != parsed[key]:
+            expected = row.get('name', '') if column == 'name' else optional_row_value(row, column.title(), column)
+            if expected is not None and expected != parsed[key]:
                 differences[column] = {'csv': expected, 'page': parsed[key]}
         entries.append({
             **result, 'status': status, 'cache_status': cached.get('status'),

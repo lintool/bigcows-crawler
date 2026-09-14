@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Cache ACM profiles through regular Safari and AppleScript on macOS.
 
 Uses a dedicated Safari window and the shared ACM cache/parser. No Playwright,
@@ -16,14 +16,14 @@ from urllib.parse import urlparse
 
 from cache_acm_fellow_profiles import (
     crawl_path, parse_crawl_date, atomic_write_json, build_report, load_json,
-    load_rows, looks_blocked, parse_profile_html, unique_profiles,
+    load_rows, classify_profile_html, unique_profiles,
     ensure_manifest, latest_attempt, record_attempt,
     AWARD_PREFIXES,
 )
 
 FETCH_SCRIPT = Path(__file__).with_name('acm_safari_fetch.applescript')
 TRANSIENT = {'blocked', 'url_error', 'timeout'}
-STATUSES = TRANSIENT | {'http_error', 'no_name', 'no_fellow_award', 'no_turing_award', 'invalid_url', 'validation_error'}
+STATUSES = TRANSIENT | {'http_error', 'no_name', 'no_fellow_award', 'no_turing_award', 'invalid_url', 'validation_error', 'missing_html'}
 
 
 def parse_args():
@@ -98,15 +98,10 @@ def close_window(window_id):
 def entry_from_html(url, html, award='fellows'):
     entry = {'html': html, 'status_code': None, 'fetched_at': timestamp(),
              'fetch_method': 'safari-applescript', 'final_url': url}
-    if looks_blocked(html) or 'too many requests' in html.lower():
-        return {**entry, 'status': 'blocked'}
-    if '404 - Your Page Could Not Be Found' in html:
-        return {**entry, 'status': 'http_error', 'error': 'ACM 404 page detected in HTML; HTTP status unavailable.'}
-    parsed = parse_profile_html(html, award)
-    status = 'ok' if parsed.get('award_heading') else ('no_turing_award' if award == 'turing' else 'no_fellow_award')
-    if not parsed.get('page_name'):
-        status = 'no_name'
-    return {**entry, **parsed, 'status': status}
+    entry.update(classify_profile_html(html, award))
+    if entry['status'] == 'http_error':
+        entry['error'] = 'ACM 404 page detected in HTML; HTTP status unavailable.'
+    return entry
 
 
 def fetch_profile(window_id, url, timeout, award='fellows'):
@@ -152,6 +147,7 @@ def main():
         pending = pending[:args.limit_new]
     window_id = None
     fetched = attempts = 0
+    attempted_urls = set()
     previous_state = load_json(args.state, {})
     batch_attempts = previous_state.get('batch_attempts', 0)
     cooldown_until = previous_state.get('cooldown_until')
@@ -164,7 +160,8 @@ def main():
             'state': state, 'detail': detail, 'updated_at': timestamp(), 'crawl_date': args.crawl_date,
             'award': args.award,
             'browser_mode': 'regular Safari via AppleScript', 'safari_window_id': window_id,
-            'total_profiles': len(profiles), 'fetched_this_run': fetched, 'attempts_this_run': attempts,
+            'total_profiles': len(profiles), 'selected_profiles': len(pending),
+            'fetched_this_run': len(attempted_urls), 'attempts_this_run': attempts,
             'batch_attempts': batch_attempts, 'cooldown_until': cooldown_until,
             'cached_profiles': report['cached_profiles'], 'status_counts': report['status_counts'],
             'review_candidate_count': report['review_candidate_count'],
@@ -211,6 +208,7 @@ def main():
                 if validate_profile and entry['status'] != 'ok':
                     entry = {**entry, 'pilot_validation_failed': True}
                 record_attempt(cache, profile.url, entry)
+                attempted_urls.add(profile.url)
                 attempts += 1
                 batch_attempts += 1
                 if batch_attempts >= args.batch_size:

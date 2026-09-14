@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Cache CSRankings faculty CSV shards from GitHub.
 
 The script is intentionally conservative:

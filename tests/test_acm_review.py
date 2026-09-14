@@ -14,6 +14,7 @@ import cache_acm_fellow_profiles as acm
 import compare_acm_fellow_profiles as compare
 import test_acm_safari as fixtures
 import cache_acm_fellow_profiles_safari as safari
+from test_acm_turing import LEGACY
 
 HTML, URL = fixtures.HTML, fixtures.URL
 
@@ -24,6 +25,69 @@ class ReviewTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.work = self.fixture.work
+
+    def test_absent_optional_columns_are_not_mismatches_but_blanks_are(self):
+        cache = {URL: safari.entry_from_html(URL, HTML)}
+        minimal = {'name': 'Example Person', 'acm_fellow_profile': URL}
+        report = acm.build_report(acm.unique_profiles([minimal]), cache)
+        self.assertEqual(report['review_candidate_count'], 0)
+        for field in ('year', 'location', 'citation'):
+            self.assertIsNone(report['entries'][0][field + '_match'])
+        self.assertEqual(compare.compare_rows([minimal], cache)['difference_counts'], {})
+        blank = {**minimal, 'year': '', 'location': '', 'citation': ''}
+        report = acm.build_report(acm.unique_profiles([blank]), cache)
+        self.assertEqual(report['review_candidate_count'], 1)
+        for field in ('year', 'location', 'citation'):
+            self.assertFalse(report['entries'][0][field + '_match'])
+        self.assertEqual(compare.compare_rows([blank], cache)['difference_counts'],
+                         {'year': 1, 'location': 1, 'citation': 1})
+
+    def test_fetch_and_audit_share_error_and_legacy_classification(self):
+        row = {'name': 'Example Person', 'acm_fellow_profile': URL}
+        cases = [('', 'missing_html'), ('<html>404 - your page could not be found</html>', 'http_error'),
+                 ('<html>Too Many Requests</html>', 'blocked'),
+                 (HTML, 'no_turing_award'), (LEGACY, 'ok'),
+                 (LEGACY.replace('</html>', '<script src="cloudflareapps.js"></script></html>'), 'ok'),
+                 (LEGACY.replace('</html>', 'cf-chl-test</html>'), 'blocked')]
+        for body, expected in cases:
+            with self.subTest(expected=expected, body=body[:30]):
+                fetched = safari.entry_from_html(URL, body, 'turing')
+                # Ignore stale parsed fields/status when re-auditing raw HTML.
+                audited = compare.compare_rows([row], {URL: {'html': body, 'status': 'ok'}}, 'turing')['entries'][0]
+                self.assertEqual(fetched['status'], expected)
+                self.assertEqual(audited['status'], expected)
+
+    def test_http_success_response_with_acm_error_html_is_not_a_profile(self):
+        class Response:
+            status = 200
+            headers = None
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self): return b'<html>404 - your page could not be found</html>'
+        with patch.object(acm.urllib.request, 'urlopen', return_value=Response()):
+            result = acm.fetch_profile(URL)
+        self.assertEqual((result['status'], result['status_code']), ('http_error', 200))
+
+    def test_progress_counts_distinct_attempted_profiles_without_lag(self):
+        f = self.fixture
+        f.write_input([URL, URL + '2'])
+        seen = []
+        def fetch(*args):
+            state = json.loads(f.state.read_text())
+            seen.append((state['fetched_this_run'], state['attempts_this_run']))
+            return {'status': 'blocked', 'html': ''} if len(seen) == 1 else safari.entry_from_html(URL, HTML)
+        with patch.object(safari, 'open_window', return_value=123), patch.object(safari, 'close_window'), patch.object(safari, 'fetch_profile', side_effect=fetch), patch.object(safari.time, 'sleep'):
+            self.assertEqual(f.run_crawler(), 0)
+        self.assertEqual(seen, [(0, 0), (1, 1), (1, 2)])
+        state = json.loads(f.state.read_text())
+        self.assertEqual((state['selected_profiles'], state['fetched_this_run'], state['attempts_this_run']), (2, 2, 3))
+
+    def test_paused_first_profile_still_counts_as_attempted(self):
+        f = self.fixture
+        with patch.object(safari, 'open_window', return_value=123), patch.object(safari, 'close_window'), patch.object(safari, 'fetch_profile', return_value={'status': 'timeout', 'html': ''}):
+            self.assertEqual(f.run_crawler('--max-retries', '0'), 1)
+        state = json.loads(f.state.read_text())
+        self.assertEqual((state['state'], state['fetched_this_run'], state['attempts_this_run']), ('paused', 1, 1))
 
     def test_void_elements_and_multiple_awards(self):
         other = '<section class="awards-winners__citation"><h2>Another Award</h2><h3 class="awards-winners__location">France - 2024</h3><p class="awards-winners__citation-short">Wrong citation.</p></section>'

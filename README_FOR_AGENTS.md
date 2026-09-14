@@ -1,6 +1,6 @@
 # Crawler Reference
 
-Run examples from `bigcows-crawler` with Python 3.10 or newer.
+Run examples from `bigcows-crawler` with Python 3.10 or newer available as `python`.
 `path/to/input.csv` is supplied by the consuming application.
 See [README.md](README.md) for input columns and shared-cache usage.
 
@@ -55,9 +55,9 @@ Start a new crawl with a date and an input snapshot, then repeat that command to
 resume. Replace the example date with the crawl start date:
 
 ```bash
-python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data path/to/input.csv --limit-new 5
-python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data path/to/input.csv
-python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data path/to/input.csv --retry-status http_error
+python scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data path/to/input.csv --limit-new 5
+python scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data path/to/input.csv
+python scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data path/to/input.csv --retry-status http_error
 ```
 
 Both ACM entry points require `--crawl-date YYYY-MM-DD`, including cache-only
@@ -67,7 +67,7 @@ unchanged when resuming across midnight. For a read-only comparison against a
 completed crawl, use the separate command with any application's current CSV:
 
 ```bash
-python3 scripts/compare_acm_fellow_profiles.py --crawl-date 2026-09-13 --data path/to/current.csv
+python scripts/compare_acm_fellow_profiles.py --crawl-date 2026-09-13 --data path/to/current.csv
 ```
 
 `--refresh` refetches every selected URL. Successful fetches replace the cache entry;
@@ -139,6 +139,12 @@ HTTP cache remain in use; a fresh local cache does not disable Safari caching.
 - `--limit-new N`: cap distinct profiles fetched this invocation; retries count toward the batch size, not this cap.
 - `--state PATH`: override `.cache/acm-fellow-profile-state-YYYY-MM-DD.json`; progress includes `crawl_date`.
 
+Progress distinguishes `selected_profiles` (profiles selected for this invocation),
+`fetched_this_run` (distinct profiles attempted, including failures), and
+`attempts_this_run` (all attempts, including retries). These counters are saved
+after every attempt. Use `status_counts` to determine successful captures;
+`fetched_this_run` alone is not a success count.
+
 The state persists `batch_attempts` and `cooldown_until` (a Unix timestamp), so
 trial runs, preparation, and resumes retain batch pacing. After a full batch,
 resuming waits only the remaining cooldown; elapsed time between invocations
@@ -160,7 +166,7 @@ be distinct.
 - **Window closed:** rerun with the same cache/report paths; a new dedicated window is opened and successful pages are skipped.
 - **Blocking persists:** the crawler backs off and pauses. Inspect the failed page/report before resuming; do not repeatedly restart or switch sessions to force progress.
 - **Pilot mismatch:** the failed validation is saved and remains blocked on resume, even with `--pilot-size 0`. Inspect the HTML, then use `--retry-status validation_error` to refetch. To explicitly accept a verified name/year variant without fetching, pass `--accept-profile URL --limit-new 0`; the acceptance is recorded. Other pilot errors require retrying their saved status. No CSV changes are automatic.
-- **Need to keep the Mac awake:** run the command with `caffeinate -i python3 ...`. Keep logs under `.cache/`; do not run another writer against the same cache, report, or state file.
+- **Need to keep the Mac awake:** run the command with `caffeinate -i python ...`. Keep logs under `.cache/`; do not run another writer against the same cache, report, or state file.
 
 Default cache path for the selected crawl date:
 
@@ -199,7 +205,7 @@ headers are unavailable, so retries use the conservative backoff described above
 
 Possible `status` values include:
 
-- `ok`: page fetched and the ACM Fellows award section was parsed.
+- `ok`: page name and the selected award section were parsed; this alone does not verify identity or every field.
 - `http_error`: an ACM 404 page was recognized in HTML (HTTP transports can also record actual HTTP errors).
 - `blocked`: ACM returned a Cloudflare/interstitial-style page instead of profile content.
 - `url_error`: AppleScript, browser-window, navigation, or loaded-URL validation failure.
@@ -208,6 +214,12 @@ Possible `status` values include:
 - `validation_error`: a fetched pilot page failed name or year compatibility; its HTML is retained for review.
 - `no_name`: page fetched but no page name was parsed.
 - `no_fellow_award`: page fetched but no `ACM Fellows` award section was parsed.
+- `no_turing_award`: page fetched but no Turing Award section or supported legacy recipient citation was parsed.
+- `missing_html`: no HTML is available to parse.
+
+Fetching and read-only comparisons use the same HTML classification rules for
+both awards. A Cloudflare script alone does not invalidate an otherwise
+recognizable modern or legacy recipient page; explicit challenge pages remain blocked.
 
 ### Reports and data review
 
@@ -223,6 +235,9 @@ and `missing`), `difference_counts`, `name_mismatch_count`, duplicate URL row in
 and unreferenced cached URLs. Row indexes start at 1 for the first data row, excluding
 the header. Each captured row reports freshly parsed fields, exact CSV/page
 differences, name compatibility, capture status, and the latest attempt status.
+Absent optional columns (`year`, `location`, `citation`, including their legacy
+title-cased aliases) are not compared. An explicitly present blank cell still
+produces a difference when the page supplies a value, making enrichment visible.
 The command exits 0 when comparison succeeds even if differences exist; review the
 report instead of treating exit 0 as agreement. The matcher handles Unicode accents
 and spacing, and only treats a first name as an initial when it is abbreviated;
@@ -240,8 +255,8 @@ but are excluded from `review_candidates`.
 `review_candidates` contains cached errors, failed latest attempts, and failed field comparisons. Years
 and locations are compared exactly, citations after whitespace normalization,
 and names with a permissive compatibility heuristic. Compatible initials, added
-name parts, and even some malformed names can pass. Missing optional comparison
-fields in the input can also produce candidates. A small candidate count is not
+name parts, and even some malformed names can pass. Absent optional columns have
+`null` match results; explicitly blank cells are still compared. A small candidate count is not
 an exhaustive list of textual differences or proof that profiles identify the
 right people; inspect exact name differences and the stored HTML when auditing.
 

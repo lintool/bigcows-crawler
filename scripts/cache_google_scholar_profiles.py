@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """Validate Google Scholar profile links and cache profile pages.
 
 The script is intentionally conservative:
