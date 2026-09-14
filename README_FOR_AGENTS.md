@@ -4,7 +4,27 @@ Run examples from `bigcows-crawler` with Python 3.10 or newer.
 `path/to/input.csv` is supplied by the consuming application.
 See [README.md](README.md) for input columns and shared-cache usage.
 
-## ACM Fellow Profile Crawler
+## ACM Fellow and Turing Award Profile Crawler
+
+The Safari runner and read-only comparison command accept `--award fellows`
+(default) or `--award turing`. Select the award explicitly when using a Turing
+input: an ACM profile can have different Fellowship and Turing years. The shared
+parser selects that award section. Turing mode also handles the older
+`amturing.acm.org` recipient pages; keywords pages without the award citation
+are reported as `no_turing_award`.
+
+Turing defaults use `acm-turing-profile-{cache,report,state,manifest}-YYYY-MM-DD.json`
+under the same Git-ignored `.cache/` directory. All date, snapshot, pacing, retry,
+and browser rules below apply to both modes. Fellows filenames and the legacy
+HTTP entry point retain their existing behavior.
+
+Use `--prepare-only` with the Safari runner to register the input and save a
+`prepared` state without opening Safari or making requests. With a new cache,
+the report lists every profile as missing and the attempt count is zero. Existing
+cache entries are preserved if this option is used again. Preparation uses the
+given input in place, so copy a stable input snapshot before invoking it. Start
+by repeating the same command without `--prepare-only`. Use the actual start date;
+if launch is postponed to another date, prepare that date separately.
 
 `scripts/cache_acm_fellow_profiles_safari.py` is the recommended ACM crawler on macOS.
 `scripts/cache_acm_fellow_profiles.py` supplies its parser, cache helpers, and
@@ -25,7 +45,7 @@ The script:
 - uses only the Python standard library and `/usr/bin/osascript` (no Playwright or WebDriver);
 - fetches each ACM profile page conservatively;
 - caches the complete fetched HTML page for reuse;
-- parses the page name, ACM Fellows award heading, location, year, and citation when available;
+- parses the page name and selected award heading, location, year, and citation when available;
 - removes recognized honorifics and credentials from parsed names; unusual or repeated titles and duplicated name parts can remain and need review;
 - compares parsed fields against the CSV row;
 - writes a JSON cache and a JSON report;
@@ -69,18 +89,28 @@ automatically. Use the input snapshot as `--data` on resumes.
 ### Crawl manifests
 
 On first invocation, both ACM crawlers create a manifest containing the start date,
-input path and SHA-256 checksum, and initial artifact paths. Subsequent invocations
-reject changed input contents, a different date, or a different cache path before
+award, input path and SHA-256 checksum, and artifact paths. Subsequent invocations
+reject changed input contents, a different award/date, or changed output paths before
 writing crawl artifacts or fetching. An identical input snapshot at another path is
 allowed. Other applications should use the comparison command against shared captures,
 or select a separate crawl for different fetch inputs.
 
-The default manifest is `.cache/acm-fellow-profile-manifest-YYYY-MM-DD.json`.
+The default manifest is `.cache/acm-fellow-profile-manifest-YYYY-MM-DD.json`
+or `.cache/acm-turing-profile-manifest-YYYY-MM-DD.json` for Turing runs.
 With `--cache custom.json`, it is `custom.manifest.json` beside that cache. Keep the
 manifest with its cache; do not delete it to bypass an input mismatch. When first
 registering an older cache without a manifest, supply its original input snapshot;
 the manifest also records `initial_cache_sha256`. That checksum describes registration
 time, not subsequent fetches. Existing manifests are not rewritten on each run.
+Historical manifests without `award` mean `fellows`. Read-only comparisons can
+select another award within the captured HTML using `--award` and an explicit
+`--cache`; the output distinguishes the requested `award` from `crawl_award`.
+Use a separate fresh cache when fetching another award's input.
+Manifest lookup uses the cache filename, independently of the requested date.
+Dated output names must match their award, date, and artifact role. Writers also
+check manifests under the shared `.cache/` and beside selected outputs to avoid
+overwriting another registered crawl, including custom paths. Keep custom artifacts
+under the shared `.cache/` so ownership checks can find their manifests.
 
 ### Safari setup and lifecycle
 
@@ -92,8 +122,10 @@ browser extension, or a Python browser package.
 
 The crawler opens a dedicated window, records its ID in the progress file, and
 closes only that window when it exits. Keep its window/tab open and unchanged.
-Other Safari windows are not navigated or closed. Each navigation first clears
-the previous document to avoid capturing stale HTML. Unexpected redirects or
+Other Safari windows are not navigated or closed. Each navigation first loads a
+local data URL with a unique marker and waits for that marker in the source. The
+requested page must then replace the marker document, preventing stale captures
+independently of the award page's layout. Unexpected redirects or
 incomplete HTML are treated as fetch errors. The native Safari session and its
 HTTP cache remain in use; a fresh local cache does not disable Safari caching.
 
@@ -107,7 +139,13 @@ HTTP cache remain in use; a fresh local cache does not disable Safari caching.
 - `--limit-new N`: cap distinct profiles fetched this invocation; retries count toward the batch size, not this cap.
 - `--state PATH`: override `.cache/acm-fellow-profile-state-YYYY-MM-DD.json`; progress includes `crawl_date`.
 
-Cache and report are saved after every attempt. Progress states are `running`,
+The state persists `batch_attempts` and `cooldown_until` (a Unix timestamp), so
+trial runs, preparation, and resumes retain batch pacing. After a full batch,
+resuming waits only the remaining cooldown; elapsed time between invocations
+counts toward the pause. Keep the state file with the crawl. Historical state
+files without these fields start their first resumed batch at zero.
+
+Cache and report are saved after every attempt. Progress states are `prepared`, `running`,
 `cooldown`, `backoff`, `paused`, `failed`, or `complete`. Completion means the
 invocation finished, not that every input URL succeeded or every field matches.
 Outside the pilot, nontransient errors such as `http_error` are recorded and the

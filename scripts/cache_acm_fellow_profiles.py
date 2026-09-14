@@ -37,6 +37,8 @@ from typing import Any
 
 
 CRAWLER_ROOT = Path(__file__).resolve().parents[1]
+AWARD_PREFIXES = {"fellows": "acm-fellow-profile", "turing": "acm-turing-profile"}
+AWARD_HEADINGS = {"fellows": "ACM Fellows", "turing": "ACM A. M. Turing Award"}
 
 
 def parse_crawl_date(value: str) -> str:
@@ -48,34 +50,69 @@ def parse_crawl_date(value: str) -> str:
     return value
 
 
-def crawl_path(kind: str, crawl_date: str) -> Path:
-    return CRAWLER_ROOT / ".cache" / f"acm-fellow-profile-{kind}-{crawl_date}.json"
+def crawl_path(kind: str, crawl_date: str, award: str = "fellows") -> Path:
+    return CRAWLER_ROOT / ".cache" / f"{AWARD_PREFIXES[award]}-{kind}-{crawl_date}.json"
 
 
-def manifest_path(cache: Path, crawl_date: str) -> Path:
-    if cache.resolve() == crawl_path("cache", crawl_date).resolve():
-        return crawl_path("manifest", crawl_date)
+def manifest_path(cache: Path, crawl_date: str, award: str = "fellows") -> Path:
+    # Derive identity from the cache, never from the requested date/award.
+    cache = cache.resolve()
+    for prefix in AWARD_PREFIXES.values():
+        match = re.fullmatch(re.escape(prefix) + r"-cache-(\d{4}-\d{2}-\d{2})\.json", cache.name)
+        if match:
+            return cache.with_name(f"{prefix}-manifest-{match[1]}.json")
     return cache.with_suffix(".manifest.json")
+
+
+def validate_artifact_paths(args, manifest_file: Path, artifacts: dict[str, str]) -> None:
+    """Reject collisions with dated artifacts and locally registered custom runs."""
+    award = getattr(args, "award", "fellows")
+    outputs = {**artifacts, "manifest": str(manifest_file.resolve())}
+    for role, value in outputs.items():
+        for owner, prefix in AWARD_PREFIXES.items():
+            match = re.fullmatch(re.escape(prefix) + r"-(cache|report|state|manifest|input|log)-(\d{4}-\d{2}-\d{2})\.(json|csv|txt)", Path(value).name)
+            if match and (owner != award or match[1] != role or match[2] != args.crawl_date):
+                raise ValueError("Output path belongs to another award, crawl date, or artifact role.")
+    # Custom manifests can live beside any selected output. Default artifacts
+    # (including nested application directories) all live under the shared cache.
+    candidates = set((CRAWLER_ROOT / ".cache").rglob("*manifest*.json"))
+    for parent in {Path(p).parent for p in outputs.values()}:
+        candidates.update(parent.glob("*manifest*.json"))
+    for candidate in candidates:
+        if candidate.resolve() == manifest_file.resolve():
+            continue
+        registered = load_json(candidate, {})
+        if "artifacts" not in registered or "input" not in registered:
+            continue
+        protected = {candidate.resolve(), Path(registered["input"]["path"]).resolve()}
+        protected.update(Path(p).resolve() for p in registered["artifacts"].values())
+        if protected.intersection(Path(p) for p in outputs.values()):
+            raise ValueError(f"Output path is already registered to another crawl: {candidate}")
 
 
 def ensure_manifest(args) -> dict[str, Any]:
     """Bind a crawl to an input snapshot; comparisons may use a different input."""
-    path = manifest_path(args.cache, args.crawl_date)
+    award = getattr(args, "award", "fellows")
+    path = manifest_path(args.cache, args.crawl_date, award)
     artifacts = {key: str(getattr(args, key).resolve()) for key in ("cache", "report", "state") if hasattr(args, key)}
     if path.resolve() in {args.data.resolve(), *(Path(p) for p in artifacts.values())}:
         raise ValueError("manifest, input, and output paths must be distinct")
+    validate_artifact_paths(args, path, artifacts)
     digest = hashlib.sha256(args.data.read_bytes()).hexdigest()
     if path.exists():
         manifest = load_json(path, {})
-        if (manifest.get("crawl_date") != args.crawl_date
+        if (manifest.get("award", "fellows") != award
+                or manifest.get("crawl_date") != args.crawl_date
                 or manifest.get("input", {}).get("sha256") != digest
                 or manifest.get("artifacts", {}).get("cache") != artifacts["cache"]):
-            raise ValueError("Crawl manifest does not match the date, input checksum, or cache path. Resume with the original input snapshot, use a new crawl, or use compare_acm_fellow_profiles.py for another input.")
+            raise ValueError("Crawl manifest does not match the award, date, input checksum, or cache path. Resume with the original input snapshot, use a new crawl, or use compare_acm_fellow_profiles.py for another input.")
+        if any(manifest["artifacts"].get(key) != value for key, value in artifacts.items()):
+            raise ValueError("Resume with the registered artifact paths; use a separate crawl for different outputs.")
         if Path(manifest["input"]["path"]).resolve() in {Path(p) for p in artifacts.values()}:
             raise ValueError("Crawl outputs must not overwrite the registered input snapshot.")
         return manifest
     manifest = {
-        "schema_version": 1, "crawl_date": args.crawl_date,
+        "schema_version": 1, "crawl_date": args.crawl_date, "award": award,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "input": {"path": str(args.data.resolve()), "sha256": digest},
         "artifacts": artifacts,
@@ -125,6 +162,8 @@ class AcmProfileParser(HTMLParser):
         self._current_section: dict[str, list[str]] | None = None
         self._current_field: str | None = None
         self._field_depth: int | None = None
+        self._citation_link: list[str] | None = None
+        self._citation_link_depth: int | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in self.VOID_TAGS:
@@ -133,6 +172,9 @@ class AcmProfileParser(HTMLParser):
             return
         attr_dict = {key: value or "" for key, value in attrs}
         self.stack.append((tag, attr_dict))
+        if tag == "a" and self._current_field == "citation":
+            self._citation_link = []
+            self._citation_link_depth = len(self.stack)
 
         if tag == "title":
             self._in_title = True
@@ -161,6 +203,12 @@ class AcmProfileParser(HTMLParser):
         if position is None:
             return
         del self.stack[position + 1:]
+        if self._citation_link_depth is not None and len(self.stack) <= self._citation_link_depth:
+            label = clean_text(" ".join(self._citation_link or []))
+            if label.casefold() != "press release" and self._current_section is not None:
+                self._current_section["citation"].extend(self._citation_link or [])
+            self._citation_link = None
+            self._citation_link_depth = None
         if tag == "title":
             self._in_title = False
 
@@ -188,11 +236,14 @@ class AcmProfileParser(HTMLParser):
         if self._h1_depth is not None:
             self.h1_parts.append(data)
         if self._current_section is not None and self._current_field is not None:
-            self._current_section[self._current_field].append(data)
+            if self._citation_link is not None:
+                self._citation_link.append(data)
+            else:
+                self._current_section[self._current_field].append(data)
 
-    def parsed(self) -> dict[str, str]:
+    def parsed(self, award: str = "fellows") -> dict[str, str]:
         section = next(
-            (item for item in self.sections if normalize_space(item.get("heading", "")).lower() == "acm fellows"),
+            (item for item in self.sections if normalize_space(item.get("heading", "")).casefold() == AWARD_HEADINGS[award].casefold()),
             {},
         )
         location, year = split_location_year(section.get("location_year", ""))
@@ -376,10 +427,15 @@ def looks_blocked(body: str) -> bool:
     return "cloudflareapps" in text and "awards-winners__citation" not in text
 
 
-def parse_profile_html(body: str) -> dict[str, str]:
+def parse_profile_html(body: str, award: str = "fellows") -> dict[str, str]:
     parser = AcmProfileParser()
     parser.feed(body)
-    parsed = parser.parsed()
+    parsed = parser.parsed(award)
+    if award == "turing" and not parsed["award_heading"]:
+        from acm_turing_legacy import parse_legacy_turing
+        legacy = parse_legacy_turing(body)
+        if legacy:
+            parsed.update(legacy)
     parsed["page_name"] = clean_person_name(parsed.get("page_name", ""))
     parsed["title"] = clean_person_name(parsed.get("title", ""))
     return parsed
