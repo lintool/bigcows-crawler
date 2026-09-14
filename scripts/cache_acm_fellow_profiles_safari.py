@@ -18,16 +18,19 @@ from cache_acm_fellow_profiles import (
     crawl_path, parse_crawl_date, atomic_write_json, build_report, load_json,
     load_rows, looks_blocked, parse_profile_html, unique_profiles,
     ensure_manifest, latest_attempt, record_attempt,
+    AWARD_PREFIXES,
 )
 
 FETCH_SCRIPT = Path(__file__).with_name('acm_safari_fetch.applescript')
 TRANSIENT = {'blocked', 'url_error', 'timeout'}
-STATUSES = TRANSIENT | {'http_error', 'no_name', 'no_fellow_award', 'invalid_url', 'validation_error'}
+STATUSES = TRANSIENT | {'http_error', 'no_name', 'no_fellow_award', 'no_turing_award', 'invalid_url', 'validation_error'}
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--data', type=Path, required=True)
+    p.add_argument('--award', choices=sorted(AWARD_PREFIXES), default='fellows', help='Award section to validate; also selects separate dated artifact names.')
+    p.add_argument('--prepare-only', action='store_true', help='Register the input and write prepared state without opening Safari or fetching.')
     p.add_argument('--crawl-date', type=parse_crawl_date, required=True, help='Crawl start date (YYYY-MM-DD); keep the same date when resuming.')
     p.add_argument('--cache', type=Path, help='Override the dated JSON cache path.')
     p.add_argument('--report', type=Path, help='Override the dated JSON report path.')
@@ -52,11 +55,13 @@ def parse_args():
             p.error(f'--{name.replace("_", "-")} must be nonnegative')
     if args.batch_size < 1 or args.timeout <= 0 or (args.limit_new is not None and args.limit_new < 0):
         p.error('batch size and timeout must be positive; limit-new must be nonnegative')
-    args.cache = args.cache or crawl_path('cache', args.crawl_date)
-    args.report = args.report or crawl_path('report', args.crawl_date)
-    args.state = args.state or crawl_path('state', args.crawl_date)
+    args.cache = args.cache or crawl_path('cache', args.crawl_date, args.award)
+    args.report = args.report or crawl_path('report', args.crawl_date, args.award)
+    args.state = args.state or crawl_path('state', args.crawl_date, args.award)
     if len({path.resolve() for path in (args.data, args.cache, args.report, args.state)}) != 4:
         p.error('input, cache, report, and state paths must be distinct')
+    if args.prepare_only and args.accept_profile:
+        p.error('--prepare-only cannot accept validation errors')
     return args
 
 
@@ -90,21 +95,21 @@ def close_window(window_id):
     run_applescript('-e', f'tell application "Safari" to close window id {int(window_id)}', timeout=15)
 
 
-def entry_from_html(url, html):
+def entry_from_html(url, html, award='fellows'):
     entry = {'html': html, 'status_code': None, 'fetched_at': timestamp(),
              'fetch_method': 'safari-applescript', 'final_url': url}
     if looks_blocked(html) or 'too many requests' in html.lower():
         return {**entry, 'status': 'blocked'}
     if '404 - Your Page Could Not Be Found' in html:
         return {**entry, 'status': 'http_error', 'error': 'ACM 404 page detected in HTML; HTTP status unavailable.'}
-    parsed = parse_profile_html(html)
-    status = 'ok' if parsed.get('award_heading') else 'no_fellow_award'
+    parsed = parse_profile_html(html, award)
+    status = 'ok' if parsed.get('award_heading') else ('no_turing_award' if award == 'turing' else 'no_fellow_award')
     if not parsed.get('page_name'):
         status = 'no_name'
     return {**entry, **parsed, 'status': status}
 
 
-def fetch_profile(window_id, url, timeout):
+def fetch_profile(window_id, url, timeout, award='fellows'):
     parsed = urlparse(url)
     failure = {'html': '', 'status_code': None, 'fetched_at': timestamp(), 'fetch_method': 'safari-applescript'}
     if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
@@ -114,7 +119,7 @@ def fetch_profile(window_id, url, timeout):
         final_url, html = output.split('\n', 1)
         if final_url != url or '</html>' not in html.lower():
             raise ValueError('Loaded URL differs from the requested URL, or HTML is incomplete.')
-        return entry_from_html(final_url, html)
+        return entry_from_html(final_url, html, award)
     except subprocess.TimeoutExpired as error:
         return {**failure, 'status': 'timeout', 'error': str(error)}
     except (subprocess.CalledProcessError, OSError, ValueError) as error:
@@ -146,16 +151,21 @@ def main():
     if args.limit_new is not None:
         pending = pending[:args.limit_new]
     window_id = None
-    fetched = attempts = batch_attempts = 0
+    fetched = attempts = 0
+    previous_state = load_json(args.state, {})
+    batch_attempts = previous_state.get('batch_attempts', 0)
+    cooldown_until = previous_state.get('cooldown_until')
 
     def save(state, detail=''):
-        report = build_report(profiles, cache)
+        report = {**build_report(profiles, cache), 'award': args.award, 'crawl_date': args.crawl_date}
         atomic_write_json(args.cache, cache)
         atomic_write_json(args.report, report)
         atomic_write_json(args.state, {
             'state': state, 'detail': detail, 'updated_at': timestamp(), 'crawl_date': args.crawl_date,
+            'award': args.award,
             'browser_mode': 'regular Safari via AppleScript', 'safari_window_id': window_id,
             'total_profiles': len(profiles), 'fetched_this_run': fetched, 'attempts_this_run': attempts,
+            'batch_attempts': batch_attempts, 'cooldown_until': cooldown_until,
             'cached_profiles': report['cached_profiles'], 'status_counts': report['status_counts'],
             'review_candidate_count': report['review_candidate_count'],
         })
@@ -167,6 +177,9 @@ def main():
         if unresolved:
             save('paused', f'Unresolved pilot validation: {unresolved[0].url}. Review, then retry its saved status or use --accept-profile URL for a name/year mismatch.')
             return 1
+        if args.prepare_only:
+            save('prepared', f'{len(pending)} profiles selected; no fetching started.')
+            return 0
         if not pending:
             save('complete', 'No fetches requested; report rebuilt from cache.')
             return 0
@@ -178,12 +191,19 @@ def main():
                                 or previous_attempt.get('status') == 'validation_error')
             for attempt in range(args.max_retries + 1):
                 if batch_attempts >= args.batch_size:
-                    pause = jittered(args.batch_pause, args.batch_pause_jitter)
-                    save('cooldown', f'Batch pause {pause:.1f}s.')
-                    time.sleep(pause)
+                    if cooldown_until is None:
+                        cooldown_until = time.time() + jittered(args.batch_pause, args.batch_pause_jitter)
+                    pause = max(0.0, cooldown_until - time.time())
+                    if pause:
+                        save('cooldown', f'Batch pause {pause:.1f}s remaining.')
+                        time.sleep(pause)
                     batch_attempts = 0
+                    cooldown_until = None
                 print(f'[{fetched + 1}/{len(pending)}] {profile.name}; attempt {attempt + 1}', flush=True)
-                entry = fetch_profile(window_id, profile.url, args.timeout)
+                if args.award == 'fellows':
+                    entry = fetch_profile(window_id, profile.url, args.timeout)
+                else:
+                    entry = fetch_profile(window_id, profile.url, args.timeout, award=args.award)
                 if validate_profile and entry['status'] == 'ok':
                     check = build_report([profile], {profile.url: entry})['entries'][0]
                     if not check['name_match'] or (profile.year and not check['year_match']):
@@ -193,6 +213,8 @@ def main():
                 record_attempt(cache, profile.url, entry)
                 attempts += 1
                 batch_attempts += 1
+                if batch_attempts >= args.batch_size:
+                    cooldown_until = time.time() + jittered(args.batch_pause, args.batch_pause_jitter)
                 save('running', f'{profile.name}: {entry["status"]}')
                 if entry['status'] not in TRANSIENT:
                     break

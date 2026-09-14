@@ -12,10 +12,11 @@ import sys
 from cache_acm_fellow_profiles import (
     compatible_name, crawl_path, latest_attempt, load_json, load_rows,
     looks_blocked, manifest_path, parse_crawl_date, parse_profile_html, row_value,
+    AWARD_PREFIXES,
 )
 
 
-def compare_rows(rows, cache):
+def compare_rows(rows, cache, award='fellows'):
     entries = []
     url_rows = {}
     for index, row in enumerate(rows, start=1):
@@ -30,7 +31,7 @@ def compare_rows(rows, cache):
             entries.append({**result, 'status': 'missing'})
             continue
         body = cached.get('html') or ''
-        parsed = parse_profile_html(body)
+        parsed = parse_profile_html(body, award)
         status = 'ok'
         if not body:
             status = 'missing_html'
@@ -41,7 +42,7 @@ def compare_rows(rows, cache):
         elif not parsed['page_name']:
             status = 'no_name'
         elif not parsed['award_heading']:
-            status = 'no_fellow_award'
+            status = 'no_turing_award' if award == 'turing' else 'no_fellow_award'
         differences = {}
         for column, key in (('name', 'page_name'), ('year', 'year'), ('location', 'location'), ('citation', 'citation')):
             expected = row.get('name', '') if column == 'name' else row_value(row, column.title(), column)
@@ -69,32 +70,34 @@ def compare_rows(rows, cache):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data', type=Path, required=True)
+    parser.add_argument('--award', choices=sorted(AWARD_PREFIXES), default='fellows')
     parser.add_argument('--crawl-date', type=parse_crawl_date, required=True)
     parser.add_argument('--cache', type=Path, help='Override the dated cache path.')
     parser.add_argument('--output', type=Path, help='Write JSON to a new file; existing files are never overwritten. Default: stdout.')
     args = parser.parse_args()
-    cache_path = args.cache or crawl_path('cache', args.crawl_date)
+    cache_path = args.cache or crawl_path('cache', args.crawl_date, args.award)
     try:
         if not cache_path.is_file():
             raise ValueError(f'Cache does not exist: {cache_path}')
-        manifest_file = manifest_path(cache_path, args.crawl_date)
+        manifest_file = manifest_path(cache_path, args.crawl_date, args.award)
         manifest = load_json(manifest_file, None)
         if manifest and (manifest.get('crawl_date') != args.crawl_date
                          or manifest.get('artifacts', {}).get('cache') != str(cache_path.resolve())):
             raise ValueError('Crawl manifest does not match the selected date or cache path.')
         protected = {args.data.resolve(), cache_path.resolve(), manifest_file.resolve()}
-        protected.update(crawl_path(kind, args.crawl_date).resolve() for kind in ('cache', 'report', 'state'))
+        protected.update(crawl_path(kind, args.crawl_date, args.award).resolve() for kind in ('cache', 'report', 'state'))
         if manifest:
             protected.update(Path(p).resolve() for p in manifest['artifacts'].values())
             protected.add(Path(manifest['input']['path']).resolve())
         if args.output and args.output.resolve() in protected:
             raise ValueError('Comparison output must not overwrite input or crawl artifacts.')
-        report = compare_rows(load_rows(args.data), load_json(cache_path, {}))
+        report = compare_rows(load_rows(args.data), load_json(cache_path, {}), args.award)
         report.update({
-            'crawl_date': args.crawl_date, 'cache': str(cache_path.resolve()),
+            'crawl_date': args.crawl_date, 'award': args.award, 'cache': str(cache_path.resolve()),
             'input': str(args.data.resolve()),
             'input_sha256': hashlib.sha256(args.data.read_bytes()).hexdigest(),
             'crawl_input_sha256': manifest['input']['sha256'] if manifest else None,
+            'crawl_award': manifest.get('award', 'fellows') if manifest else None,
         })
         output = json.dumps(report, indent=2, ensure_ascii=False) + '\n'
         if args.output:

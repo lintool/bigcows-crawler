@@ -130,7 +130,7 @@ class SafariTests(unittest.TestCase):
         self.write_input([URL, URL + '2'])
         good = safari.entry_from_html(URL, HTML)
         blocked = safari.entry_from_html(URL, '<html>Sorry, you have been blocked</html>')
-        with patch.object(safari, 'open_window', return_value=123), patch.object(safari, 'close_window'), patch.object(safari, 'fetch_profile', side_effect=[blocked, good, good]), patch.object(safari.time, 'sleep') as sleep:
+        with patch.object(safari, 'open_window', return_value=123), patch.object(safari, 'close_window'), patch.object(safari, 'fetch_profile', side_effect=[blocked, good, good]), patch.object(safari.time, 'time', return_value=1000), patch.object(safari.time, 'sleep') as sleep:
             self.assertEqual(self.run_crawler('--batch-size', '2', '--batch-pause', '75', '--batch-pause-jitter', '0'), 0)
         self.assertEqual([c.args[0] for c in sleep.call_args_list if c.args[0] > 0], [75])
 

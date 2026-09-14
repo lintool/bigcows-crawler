@@ -1,6 +1,6 @@
 # Big Cows Crawler
 
-Shared Python crawlers for ACM Fellow profiles, DBLP profiles, Google Scholar
+Shared Python crawlers for ACM Fellow and Turing Award profiles, DBLP profiles, Google Scholar
 profiles, and CSRankings faculty data. Applications supply their own inputs and
 consume cached results or explicitly requested exports.
 
@@ -30,6 +30,7 @@ even when invoked from another directory.
 
 ```bash
 python3 scripts/cache_acm_fellow_profiles_safari.py --crawl-date 2026-09-14 --data /path/to/people.csv
+python3 scripts/cache_acm_fellow_profiles_safari.py --award turing --crawl-date 2026-09-14 --data /path/to/turing-winners.csv
 python3 scripts/cache_dblp_profiles.py --data /path/to/people.csv
 python3 scripts/cache_google_scholar_profiles.py --data /path/to/people.csv
 python3 scripts/cache_csrankings.py
@@ -60,6 +61,10 @@ All default crawl artifacts live under this repository's Git-ignored `.cache/`:
   acm-fellow-profile-report-YYYY-MM-DD.json
   acm-fellow-profile-state-YYYY-MM-DD.json
   acm-fellow-profile-manifest-YYYY-MM-DD.json
+  acm-turing-profile-cache-YYYY-MM-DD.json
+  acm-turing-profile-report-YYYY-MM-DD.json
+  acm-turing-profile-state-YYYY-MM-DD.json
+  acm-turing-profile-manifest-YYYY-MM-DD.json
   dblp-profile-cache.json
   dblp-profile-report.json
   google-scholar-profile-cache.json
@@ -96,6 +101,33 @@ canonical datasets, analyses, and visualizations remain in their applications.
 
 ## Fresh ACM crawl and resuming
 
+The shared Safari runner defaults to `--award fellows`; use `--award turing`
+for Turing Award years and citations. The existing script name is retained for
+compatibility. Turing mode supports both modern `awards.acm.org` profiles and
+the older `amturing.acm.org` recipient layout. The URL column remains
+`acm_fellow_profile` for compatibility with existing application CSVs.
+
+Both awards can use the same `.cache/` directory and start date. Their filenames
+have different prefixes, so their inputs, manifests, cache, report, and progress
+remain separate. Start with an empty Turing cache for a fresh crawl; do not seed
+it from the Fellows cache. Add `--prepare-only` to register the input and write
+an empty cache/report plus `prepared` state without opening Safari or fetching:
+
+```bash
+python3 scripts/cache_acm_fellow_profiles_safari.py --award turing --crawl-date 2026-09-14 --data /path/to/stable-input.csv --prepare-only
+```
+
+Remove `--prepare-only` to start. Retain the same date and input snapshot to
+resume. Preparation does not copy the input; save your stable snapshot under
+`.cache/acm-turing-profile-input-YYYY-MM-DD.csv` before registering it. If the
+actual crawl will start on a later date, prepare new paths for that date.
+
+For read-only comparison, use `compare_acm_fellow_profiles.py --award turing`.
+An explicit `--cache` can select a Fellows capture containing the same profile:
+the comparison reparses raw HTML for the requested award without modifying it.
+Writers cannot resume a manifest under a different award. Historical Fellows
+manifests without an award field are interpreted as Fellows crawls.
+
 Safari defaults to one profile at a time, a 5–7 second delay, and a 60–90 second
 pause every 25 fetch attempts. It checks the first five fetched profiles against
 the input name/year before continuing. Persistent blocking or browser errors
@@ -121,8 +153,10 @@ a run, or supply a snapshot named `acm-fellow-profile-input-YYYY-MM-DD.csv`.
 Capture console output as `acm-fellow-profile-log-YYYY-MM-DD.txt` if needed.
 Input snapshots and log files are managed by the caller, not created automatically.
 The manifest is created automatically and records the crawl date, input checksum,
-and artifact paths. Reusing a crawl with changed input contents is rejected;
-resuming with an identical snapshot at another path is allowed.
+and artifact paths. Reusing a crawl with changed input contents or output paths
+is rejected; resuming with an identical snapshot at another path is allowed.
+Keep its state file: batch counts and cooldown deadlines persist across trial
+runs and resumes, with elapsed time counting toward the cooldown.
 
 Safari saves the loaded HTML, parsed fields, timestamps, final URL, and
 `fetch_method: safari-applescript`. It does **not** expose HTTP status codes or
