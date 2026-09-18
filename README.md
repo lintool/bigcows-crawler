@@ -34,6 +34,8 @@ python scripts/cache_google_scholar_profiles.py --data /path/to/people.csv
 python scripts/cache_csrankings.py
 ```
 
+If DBLP returns bot-check pages, use the [paced Safari workflow](README_FOR_AGENTS.md#safari-transport), which retains a resumable crawl and full page captures.
+
 Profile inputs contain a `name` and a source-specific URL column; see the [input reference](README_FOR_AGENTS.md#inputs-and-paths) for the schema.
 CSRankings downloads its faculty CSV shards without an application input.
 

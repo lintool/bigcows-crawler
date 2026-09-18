@@ -244,10 +244,12 @@ def read_error_body(error: urllib.error.HTTPError) -> str:
 def looks_blocked(body: str) -> bool:
     text = body.lower()
     return (
-        "captcha" in text
+        bool(re.search(r"<(?:title|h1)\b[^>]*>[^<]*(?:captcha|not a bot|verify.{0,30}human)", text))
+        or bool(re.search(r"<(?:script|iframe)\b[^>]*\bsrc\s*=\s*[\"'][^\"']*(?:/recaptcha/|hcaptcha\.com/)", text))
         or "cf-browser-verification" in text
         or "cloudflare ray id" in text
         or "our systems have detected unusual traffic" in text
+        or bool(re.search(r"<script\b[^>]*\bid\s*=\s*[\"']anubis_challenge[\"']", text))
     )
 
 
