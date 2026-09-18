@@ -33,13 +33,15 @@ ACM optional-field comparison semantics are documented under [Reports and data r
 
 Default artifacts live under this repository's Git-ignored `.cache/`.
 Each source's section below documents its filenames and schemas.
-Profile caches are URL-keyed JSON containing HTML, parsed fields, status, and timestamps.
+Profile cache indexes are URL-keyed JSON containing parsed fields, status, and timestamps.
+ACM, Scholar and HTTP DBLP entries embed HTML; DBLP Safari entries reference separate HTML files through `html_path` and `html_sha256`.
 Different applications can consume the same captured profiles.
 ACM manifests bind each crawl to one input checksum; use read-only comparison for another application's CSV, or a separate crawl for different fetch inputs.
 
 Reports describe the selected input and are replaced on subsequent runs.
 Use an application-specific `--report .cache/my-app/scholar-report.json` to retain separate reports.
-Writers do not lock shared caches: run them sequentially.
+Run writers against shared artifacts sequentially.
+DBLP Safari locks its run directory; other writers do not provide a shared-cache lock.
 Independent concurrent runs need separate cache and report paths, plus state paths for ACM (or `--cache-dir` for CSRankings).
 Keep overrides under `.cache/`.
 
@@ -634,6 +636,12 @@ The cache is intentionally idempotent:
 - pass `--refresh` to refetch cached URLs;
 - interrupted runs can be resumed safely because the cache is written after every request.
 
+Ordinary resume skips cached failures unless they are explicitly selected with `--retry-status` or need missing HTML refetched.
+Statuses `ok`, `blocked`, `http_error` and `no_title` require HTML; entries with one of those statuses and no HTML are refetched even without `--retry-status`.
+A transient failure can preserve an older entry and attach the failed result as `last_fetch_error`.
+Inspect that cache field directly: the report does not include it, and the retained entry can still have status `ok` and an older `fetched_at`.
+Selecting `--retry-status` uses the retained top-level status, not `last_fetch_error.status`; use a targeted input with `--refresh` when explicitly retrying such URLs, after reviewing the failure.
+
 The cache stores complete HTML, so it can become large.
 `.cache/` is local-only and ignored by Git.
 If `.cache/` is missing, the crawler creates it automatically when it writes the cache/report.
@@ -720,7 +728,10 @@ Google Scholar default behavior is therefore:
 
 Because the Scholar crawler now requires full-page cache entries, older metadata-only entries are counted as `incomplete_cached_profiles` in the report and will be fetched again on a normal resume unless capped by `--limit-new`.
 
-If Google block markers appear while running the Scholar crawler, stop the run and resume later without `--refresh`.
+If Google block markers appear while running the Scholar crawler, interrupt the run and inspect the saved response.
+The runner records blocking but does not stop automatically or return a failing exit status solely because profiles failed.
+After the block is resolved, resume with the same cache and use the [cache retry rules](#cache) for failed entries; a normal resume can otherwise skip the blocked URL.
+Batch counters and cooldown timing are local to each Scholar invocation, so repeated short runs do not preserve the batch cooldown as ACM and DBLP Safari runs do.
 
 ### Google Scholar Block Detection
 
