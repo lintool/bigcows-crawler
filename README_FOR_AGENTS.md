@@ -302,6 +302,47 @@ Crawl reports describe the bound input snapshot; use the separate comparison com
 
 ## DBLP Profile Crawler
 
+### Safari Transport
+
+When plain HTTP returns Anubis challenge pages, use regular Safari on macOS with the same native Automation setup as the [ACM crawler](#safari-setup-and-lifecycle).
+The DBLP runner opens and closes a dedicated window, clears the previous document before navigation, and waits for the site's normal browser challenge to finish.
+The normal `.html` suffix redirect counts as the same PID.
+Other redirects are saved as `redirect_review` with their requested URL, final URL, and full HTML; they appear in review candidates and do not pause the crawl, including during the pilot.
+These captures are not automatically accepted as the intended person's profile and are skipped on ordinary resume.
+It stops on persistent challenges, transport errors, or a failed pilot; it never writes canonical CSVs.
+
+Choose a new run directory under the shared `.cache/` and use a stable input snapshot:
+
+```bash
+python scripts/cache_dblp_profiles_safari.py --data path/to/input-snapshot.csv --run-dir .cache/dblp-safari-YYYY-MM-DD-HHMM --limit-new 5
+python scripts/cache_dblp_profiles_safari.py --data path/to/input-snapshot.csv --run-dir .cache/dblp-safari-YYYY-MM-DD-HHMM
+```
+
+The runner records an input checksum and refuses changed inputs or concurrent writers to the same run directory.
+It retains full HTML in individual `captures/` files, avoiding repeated serialization of a potentially multi-gigabyte cache.
+Its `cache.json` is a URL-keyed metadata index with `html_path` relative to the run directory, `html_sha256`, `html_bytes`, title, status, capture timestamp, final URL, and transport.
+This differs from the HTTP crawler's embedded-HTML cache; consumers must read the referenced HTML file when full content is needed.
+Safari does not expose HTTP response codes through this transport, so `status_code` is `null`.
+The run also retains `input.csv`, `manifest.json`, `attempts.jsonl`, `report.json`, and `state.json`.
+Historical attempt records and HTML captures survive explicit retries.
+
+Defaults are 5–7 seconds between profiles, a 60–90-second pause every 25 attempts, and a 60-second page-load timeout.
+Batch progress, the next-request time, and cooldown deadlines persist across pilot and resume invocations.
+The first five fetched profiles in each invocation must have matching names and valid author markup unless recorded as redirects for later review; this is a screening check, not proof of identity.
+Successful cached captures are skipped on resume.
+Inspect a saved failure before selecting its status with `--retry-status blocked`, `--retry-status url_error`, or another reported status.
+The runner does not automatically retry blocking.
+`invocation_finished` means the selected work finished; always inspect report coverage and review candidates.
+Use `caffeinate -i python ...` for long runs when needed.
+
+Validation:
+
+```bash
+python -B -m unittest discover -s tests -p 'test_dblp*.py'
+```
+
+### HTTP Transport
+
 `scripts/cache_dblp_profiles.py` caches the `dblp_profile` URLs in the caller-supplied CSV:
 
 ```text
