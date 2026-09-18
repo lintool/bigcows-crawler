@@ -648,8 +648,9 @@ The cache is intentionally idempotent:
 - pass `--refresh` to refetch cached URLs;
 - interrupted runs can be resumed safely because the cache is written after every request.
 
-Ordinary resume skips cached failures unless they are explicitly selected with `--retry-status` or need missing HTML refetched.
-Statuses `ok`, `blocked`, `http_error`, `no_title` and `parse_error` require HTML; entries with one of those statuses and missing or invalid captures are refetched even without `--retry-status`.
+Ordinary resume skips completed cached failures unless they are explicitly selected with `--retry-status` or need incomplete HTML refetched.
+Statuses `ok`, `blocked`, `http_error`, `no_title` and `parse_error` require nonempty HTML; entries with one of those statuses and missing, empty, or invalid captures are refetched even without `--retry-status`.
+Empty response files remain in the capture history but do not count toward `html_cached_profiles`.
 Every unsuccessful refresh preserves an existing successful entry and attaches the latest failed result as `last_fetch_error`.
 The report includes that failure; the retained entry can still have status `ok` and an older `fetched_at`.
 Selecting `--retry-status` uses the retained top-level status, not `last_fetch_error.status`; use a targeted input with `--refresh` when explicitly retrying such URLs, after reviewing the failure.
@@ -662,6 +663,9 @@ Responses with bodies also record their file path, SHA-256 checksum, byte count,
 Paths are relative to the cache's parent directory; keep the capture directory alongside the cache when moving or backing up artifacts.
 Capture filenames include a profile hash, timestamp, page offset, and unique ID, so repeated requests never overwrite earlier captures.
 The crawler saves each response body and atomically updates the manifest before updating the derived cache, including intermediate retries and failed refreshes.
+New HTTP attempts record their attempt number and `retry_pending`, which is true when another retry is scheduled in the current sequence.
+If the process stops during that sequence, ordinary resume fetches the profile again using the new invocation's retry budget, including when the unfinished attempt is attached to an earlier success as `last_fetch_error`.
+Completed sequences record `retry_pending: false`; legacy records without this field retain their previous cache-reuse behavior.
 Network failures without a response body still get manifest records, without invented HTML files.
 The manifest recovers attempts interrupted before the cache write; concurrent writers to the same cache are not supported.
 
@@ -689,6 +693,8 @@ python scripts/cache_google_scholar_profiles.py --data path/to/input.csv --rebui
 
 `--rebuild-cache` makes no network requests, requires an existing manifest, and rejects `--refresh` and `--retry-status`.
 It selects the last successful capture for each profile, retains later failures as `last_fetch_error`, and runs the current parser to recreate derived fields.
+Historical `parse_error` captures are reparsed before selection, so a response understood by the current parser can become the selected success even when later attempts failed.
+Parser exceptions are isolated per capture and recorded as `parse_error` with an `error` field; other profiles continue processing and reports are still written.
 All historical responses remain available through the manifest for custom analysis.
 Missing or checksum-invalid selected files produce warnings and `html_error` report fields; a normal online resume attempts to replace these incomplete captures.
 A metadata-only legacy entry has no raw body from which to rebuild parsed fields.
@@ -738,9 +744,11 @@ Each report entry includes:
 - `i10_index_since_5y_ago`: recent Scholar i10-index.
 - `first_citation_year`: earliest year shown in Scholar's `Citations per year` chart.
 - `citation_by_year`: JSON object mapping year strings to citation counts from Scholar's `Citations per year` chart.
-- `html_cached`: whether the selected capture is available and passed integrity checks.
+- `html_cached`: whether the selected capture is nonempty, available, and passed integrity checks.
 - `html_path`: cache-relative path to the selected raw capture.
 - `html_error`: capture read or checksum failure, when present.
+- `error`: fetch or parser failure details, when present.
+- `retry_pending`: whether a retry sequence was interrupted for this profile, including a failed refresh of an earlier success.
 - `last_fetch_error`: latest unsuccessful refresh retained alongside an earlier success.
 - `match`: `true`, `false`, or `null`.
 - `fetched_at`: cache timestamp, when available.

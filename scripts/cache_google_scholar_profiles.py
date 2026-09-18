@@ -197,7 +197,13 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def has_html(entry: dict[str, Any]) -> bool:
-    return bool(entry.get("html") or entry.get("html_path") and not entry.get("html_error"))
+    return bool(entry.get("html") or (
+        entry.get("html_path") and entry.get("html_bytes", 0) > 0 and not entry.get("html_error")
+    ))
+
+
+def needs_retry_resume(entry: dict[str, Any]) -> bool:
+    return bool(entry.get("retry_pending") or entry.get("last_fetch_error", {}).get("retry_pending"))
 
 
 def retain_result(cache: dict[str, Any], url: str, result: dict[str, Any]) -> None:
@@ -263,6 +269,7 @@ class CaptureStore:
             "capture_id", "profile_url", "requested_url", "final_url", "fetched_at",
             "status", "status_code", "error", "encoding", "response_headers",
             "cstart", "pagesize", "html_path", "html_sha256", "html_bytes", "body_source",
+            "attempts", "retry_pending",
         )
         capture = {key: entry[key] for key in fields if key in entry}
         self.manifest["captures"].append(capture)
@@ -285,12 +292,18 @@ class CaptureStore:
         # Replaying also recovers attempts saved before an interrupted cache write.
         recovered: dict[str, Any] = {}
         for capture in self.manifest["captures"]:
-            retain_result(recovered, capture["profile_url"], capture.copy())
+            candidate = capture.copy()
+            if candidate.get("status") == "parse_error":
+                # A fixed parser may turn this historical response into the latest
+                # success, even if subsequent attempts failed without a body.
+                enrich_cache_from_html({candidate["profile_url"]: candidate}, self)
+            retain_result(recovered, candidate["profile_url"], candidate)
         for url, entry in recovered.items():
             previous = cache.get(url, {})
             if previous.get("capture_id") == entry["capture_id"]:
                 # Preserve derived fields when a capture is missing or unreadable.
-                previous = {key: value for key, value in previous.items() if key != "last_fetch_error"}
+                previous = {key: value for key, value in previous.items()
+                            if key not in {"last_fetch_error", "error", "html_error"}}
                 recovered[url] = {**previous, **entry}
         cache.update(recovered)
 
@@ -657,11 +670,11 @@ def fetch_profile(url: str, max_retries: int, backoff: float, backoff_jitter: fl
     attempts = 0
     while True:
         result = fetch_profile_once(url, page_size)
+        result["attempts"] = attempts + 1
+        result["retry_pending"] = attempts < max_retries and should_retry(result)
         if capture_store is not None:
             result = capture_store.save(url, result)
-        if attempts >= max_retries or not should_retry(result):
-            if attempts:
-                result["attempts"] = attempts + 1
+        if not result["retry_pending"]:
             return result
 
         pause = sleep_seconds(backoff * (2**attempts), backoff_jitter)
@@ -689,7 +702,13 @@ def enrich_cache_from_html(cache: dict[str, Any], store: CaptureStore | None = N
             continue
         if not body:
             continue
-        parsed = parse_profile_html(body)
+        try:
+            parsed = parse_profile_html(body)
+        except Exception as error:
+            cached["status"] = "parse_error"
+            cached["error"] = f"{type(error).__name__}: {error}"
+            print(f"Warning: could not parse {cached.get('html_path', 'cached HTML')}: {cached['error']}", file=sys.stderr)
+            continue
         if cached.get("status") == "parse_error":
             cached["status"] = "blocked" if is_blocked_page(body) else "ok" if parsed.get("title") else "no_title"
             cached.pop("error", None)
@@ -748,6 +767,8 @@ def build_report(profiles: list[ScholarProfile], cache: dict[str, Any]) -> dict[
                 "html_cached": has_html(cached),
                 "html_path": cached.get("html_path"),
                 "html_error": cached.get("html_error"),
+                "error": cached.get("error"),
+                "retry_pending": needs_retry_resume(cached),
                 "last_fetch_error": cached.get("last_fetch_error"),
                 "match": match,
                 "fetched_at": cached.get("fetched_at"),
@@ -861,7 +882,8 @@ def main() -> int:
         cached = cache.get(profile.url)
         refetch_status = bool(cached and cached.get("status") in retry_statuses)
         incomplete_cache = bool(cached and needs_html_refetch(cached))
-        if cached and not args.refresh and not refetch_status and not incomplete_cache:
+        pending_retry = bool(cached and needs_retry_resume(cached))
+        if cached and not args.refresh and not refetch_status and not incomplete_cache and not pending_retry:
             continue
 
         if args.limit_new is not None and new_requests >= args.limit_new:

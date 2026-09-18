@@ -228,6 +228,128 @@ class ScholarCaptureTests(unittest.TestCase):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 self.run_crawler("--rebuild-cache", *option)
 
+    def test_interrupted_retries_resume_even_with_previous_success(self):
+        cases = ("429", "503", "timeout", "url_error")
+        for previous_success in (False, True):
+            for failure in cases:
+                with self.subTest(previous_success=previous_success, failure=failure):
+                    self.cache = self.work / f"retry-{previous_success}-{failure}.json"
+                    if previous_success:
+                        with patch.object(SCHOLAR.urllib.request, "urlopen", return_value=Response(HTML.encode())):
+                            self.run_crawler()
+                    if failure.isdigit():
+                        error = urllib.error.HTTPError(URL, int(failure), "busy", Message(), io.BytesIO(b"busy"))
+                    elif failure == "timeout":
+                        error = TimeoutError()
+                    else:
+                        error = urllib.error.URLError("offline")
+                    with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=error), patch.object(SCHOLAR.time, "sleep", side_effect=KeyboardInterrupt):
+                        with self.assertRaises(KeyboardInterrupt):
+                            self.run_crawler("--refresh")
+                    interrupted = self.store().manifest["captures"][-1]
+                    self.assertTrue(interrupted["retry_pending"])
+                    with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                        self.run_crawler("--limit-new", "0")
+                    self.assertTrue(json.loads(self.report.read_text())["entries"][0]["retry_pending"])
+                    with patch.object(SCHOLAR.urllib.request, "urlopen", return_value=Response(HTML.encode())) as fetch:
+                        recovered = self.run_crawler()
+                    self.assertEqual(fetch.call_count, 1)
+                    self.assertEqual(recovered["status"], "ok")
+                    self.assertFalse(recovered["retry_pending"])
+                    self.assertNotIn("last_fetch_error", recovered)
+                    with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                        self.run_crawler()
+
+    def test_exhausted_retry_sequences_remain_cached(self):
+        for previous_success in (False, True):
+            for failure in ("503", "timeout"):
+                with self.subTest(previous_success=previous_success, failure=failure):
+                    self.cache = self.work / f"exhausted-{previous_success}-{failure}.json"
+                    if previous_success:
+                        with patch.object(SCHOLAR.urllib.request, "urlopen", return_value=Response(HTML.encode())):
+                            self.run_crawler()
+                    errors = [
+                        TimeoutError() if failure == "timeout" else
+                        urllib.error.HTTPError(URL, 503, "busy", Message(), io.BytesIO(b"busy"))
+                        for _ in range(2)
+                    ]
+                    with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=errors) as fetch:
+                        self.run_crawler("--refresh")
+                    self.assertEqual(fetch.call_count, 2)
+                    self.assertFalse(self.store().manifest["captures"][-1]["retry_pending"])
+                    with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                        self.run_crawler()
+
+    def test_parser_failures_do_not_block_other_profiles_or_reports(self):
+        bad_html = HTML + "<!-- bad capture -->"
+        good_url, new_url = URL + "2", URL + "3"
+        self.source.write_text("name,google_scholar_profile\nExample Person," + URL +
+                               "\nExample Person," + good_url + "\nExample Person," + new_url + "\n")
+        for stored_status in ("ok", "parse_error"):
+            self.cache = self.work / f"isolated-{stored_status}.json"
+            store = self.store()
+            bad = store.save(URL, {"status": stored_status, "html": bad_html})
+            store.save(good_url, {"status": "ok", "html": HTML})
+            original_parser = SCHOLAR.parse_profile_html
+            def failing_parser(body):
+                if "bad capture" in body:
+                    raise ValueError("bad capture")
+                return original_parser(body)
+            with patch.object(SCHOLAR, "parse_profile_html", side_effect=failing_parser), contextlib.redirect_stderr(io.StringIO()):
+                for mode in (("--limit-new", "0"), ("--rebuild-cache",)):
+                    with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                        entry = self.run_crawler(*mode)
+                    self.assertEqual(entry["status"], "parse_error")
+                    self.assertEqual(entry["error"], "ValueError: bad capture")
+                    self.assertEqual(json.loads(self.cache.read_text())[good_url]["citations"], "123")
+                    report = json.loads(self.report.read_text())
+                    self.assertEqual(report["status_counts"], {"parse_error": 1, "ok": 1, "missing": 1})
+                    self.assertEqual(report["entries"][0]["error"], "ValueError: bad capture")
+                with patch.object(SCHOLAR.urllib.request, "urlopen", return_value=Response(HTML.encode())) as fetch:
+                    self.run_crawler()
+                self.assertEqual(fetch.call_count, 1)
+                self.assertEqual(json.loads(self.cache.read_text())[new_url]["status"], "ok")
+            self.assertEqual((self.work / bad["html_path"]).read_text(), bad_html)
+
+    def test_replay_recovers_parse_error_before_later_failure_selection(self):
+        store = self.store()
+        store.save(URL, {"status": "ok", "html": HTML.replace("123", "100")})
+        recovered_capture = store.save(URL, {"status": "parse_error", "error": "old parser bug", "html": HTML})
+        failure = store.save(URL, {"status": "timeout", "retry_pending": False})
+        manifest_before = store.manifest_path.read_bytes()
+        with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=AssertionError("network")):
+            for mode in (("--rebuild-cache",), ()):
+                entry = self.run_crawler(*mode)
+                self.assertEqual(entry["status"], "ok")
+                self.assertEqual(entry["citations"], "123")
+                self.assertEqual(entry["capture_id"], recovered_capture["capture_id"])
+                self.assertNotIn("error", entry)
+                self.assertEqual(entry["last_fetch_error"]["capture_id"], failure["capture_id"])
+        self.assertEqual(store.manifest_path.read_bytes(), manifest_before)
+
+    def test_zero_byte_responses_are_retained_but_refetched(self):
+        for http_error in (False, True):
+            with self.subTest(http_error=http_error):
+                self.cache = self.work / f"empty-{http_error}.json"
+                kwargs = (
+                    {"side_effect": urllib.error.HTTPError(URL, 404, "missing", Message(), io.BytesIO(b""))}
+                    if http_error else {"return_value": Response(b"")}
+                )
+                with patch.object(SCHOLAR.urllib.request, "urlopen", **kwargs):
+                    empty = self.run_crawler()
+                self.assertEqual((self.work / empty["html_path"]).read_bytes(), b"")
+                self.assertEqual(empty["html_bytes"], 0)
+                with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                    self.run_crawler("--limit-new", "0")
+                report = json.loads(self.report.read_text())
+                self.assertEqual(report["html_cached_profiles"], 0)
+                self.assertEqual(report["incomplete_cached_profiles"], 1)
+                with patch.object(SCHOLAR.urllib.request, "urlopen", return_value=Response(HTML.encode())) as fetch:
+                    recovered = self.run_crawler()
+                self.assertEqual(fetch.call_count, 1)
+                self.assertEqual(recovered["status"], "ok")
+                self.assertEqual(len(self.store().manifest["captures"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
