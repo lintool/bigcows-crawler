@@ -43,6 +43,8 @@ CSRankings downloads its faculty CSV shards without an application input.
 
 Crawled pages and reports stay in this repository's Git-ignored `.cache/`.
 ACM captures are grouped by award and crawl start date.
+Scholar requests the first 100 publications per profile and retains separate raw HTML captures with a manifest for offline reprocessing.
+Existing Scholar caches migrate locally on their next run; see the [capture and rebuild reference](README_FOR_AGENTS.md#raw-captures-and-offline-reprocessing).
 Multiple applications can read the same captures; run writers to a shared cache sequentially.
 Canonical datasets and application-specific analysis belong in the consuming application.
 
