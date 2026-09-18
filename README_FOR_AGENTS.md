@@ -676,7 +676,7 @@ Existing complete 20-row captures remain reusable; changing `--page-size` does n
 Use a targeted input with `--refresh --limit-new N` to upgrade selected profiles gradually.
 `--page-size 20` restores the previous requested page size for new fetches.
 
-Normal runs reparse the selected saved HTML into the profile-statistics cache before fetching missing profiles.
+Normal runs reparse historical pages with parser-derived statuses before selecting captures and enriching the profile-statistics cache.
 Publication rows remain in the raw HTML for later extraction; the profile CSV schema is unchanged.
 To migrate or reprocess the current cache without any requests:
 
@@ -693,7 +693,8 @@ python scripts/cache_google_scholar_profiles.py --data path/to/input.csv --rebui
 
 `--rebuild-cache` makes no network requests, requires an existing manifest, and rejects `--refresh` and `--retry-status`.
 It selects the last successful capture for each profile, retains later failures as `last_fetch_error`, and runs the current parser to recreate derived fields.
-Historical `parse_error` captures are reparsed before selection, so a response understood by the current parser can become the selected success even when later attempts failed.
+Historical `ok`, `no_title`, `parse_error`, and `blocked` captures with successful or unknown legacy HTTP status are reclassified before selection, so a response understood by the current parser can become the selected success even when later attempts failed.
+Reclassification checks current block markers and never promotes an HTTP failure to success based on its HTML title.
 Parser exceptions are isolated per capture and recorded as `parse_error` with an `error` field; other profiles continue processing and reports are still written.
 All historical responses remain available through the manifest for custom analysis.
 Missing or checksum-invalid selected files produce warnings and `html_error` report fields; a normal online resume attempts to replace these incomplete captures.

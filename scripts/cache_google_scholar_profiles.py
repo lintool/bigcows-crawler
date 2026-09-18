@@ -45,6 +45,7 @@ SUFFIXES = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv"}
 PARTICLES = {"al", "bin", "da", "de", "del", "den", "der", "di", "du", "la", "le", "van", "von"}
 TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
 HTML_REQUIRED_STATUSES = {"ok", "blocked", "http_error", "no_title", "parse_error"}
+PARSER_DERIVED_STATUSES = {"ok", "blocked", "no_title", "parse_error"}
 PROFILE_CSV_COLUMNS = [
     "name",
     "profile",
@@ -206,6 +207,13 @@ def needs_retry_resume(entry: dict[str, Any]) -> bool:
     return bool(entry.get("retry_pending") or entry.get("last_fetch_error", {}).get("retry_pending"))
 
 
+def can_reclassify(entry: dict[str, Any]) -> bool:
+    status_code = entry.get("status_code")
+    return entry.get("status") in PARSER_DERIVED_STATUSES and (
+        status_code is None or 200 <= status_code < 300
+    )
+
+
 def retain_result(cache: dict[str, Any], url: str, result: dict[str, Any]) -> None:
     previous = cache.get(url)
     if previous and previous.get("status") == "ok" and result.get("status") != "ok":
@@ -293,7 +301,7 @@ class CaptureStore:
         recovered: dict[str, Any] = {}
         for capture in self.manifest["captures"]:
             candidate = capture.copy()
-            if candidate.get("status") == "parse_error":
+            if can_reclassify(candidate):
                 # A fixed parser may turn this historical response into the latest
                 # success, even if subsequent attempts failed without a body.
                 enrich_cache_from_html({candidate["profile_url"]: candidate}, self)
@@ -705,11 +713,12 @@ def enrich_cache_from_html(cache: dict[str, Any], store: CaptureStore | None = N
         try:
             parsed = parse_profile_html(body)
         except Exception as error:
-            cached["status"] = "parse_error"
+            if can_reclassify(cached):
+                cached["status"] = "parse_error"
             cached["error"] = f"{type(error).__name__}: {error}"
             print(f"Warning: could not parse {cached.get('html_path', 'cached HTML')}: {cached['error']}", file=sys.stderr)
             continue
-        if cached.get("status") == "parse_error":
+        if can_reclassify(cached):
             cached["status"] = "blocked" if is_blocked_page(body) else "ok" if parsed.get("title") else "no_title"
             cached.pop("error", None)
         if parsed.get("title"):

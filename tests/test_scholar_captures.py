@@ -350,6 +350,61 @@ class ScholarCaptureTests(unittest.TestCase):
                 self.assertEqual(recovered["status"], "ok")
                 self.assertEqual(len(self.store().manifest["captures"]), 2)
 
+    def test_no_title_capture_recovers_with_or_without_later_timeout(self):
+        for later_timeout in (False, True):
+            with self.subTest(later_timeout=later_timeout):
+                self.cache = self.work / f"no-title-{later_timeout}.json"
+                store = self.store()
+                capture = store.save(URL, {"status": "no_title", "status_code": 200, "html": HTML})
+                if later_timeout:
+                    failure = store.save(URL, {"status": "timeout", "retry_pending": False})
+                manifest_before = store.manifest_path.read_bytes()
+                with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                    for mode in (("--rebuild-cache",), ()):
+                        entry = self.run_crawler(*mode)
+                        self.assertEqual(entry["status"], "ok")
+                        self.assertEqual(entry["title"], "Example Person")
+                        self.assertEqual(entry["citations"], "123")
+                        self.assertEqual(entry["capture_id"], capture["capture_id"])
+                        if later_timeout:
+                            self.assertEqual(entry["last_fetch_error"]["capture_id"], failure["capture_id"])
+                        else:
+                            self.assertNotIn("last_fetch_error", entry)
+                self.assertEqual(store.manifest_path.read_bytes(), manifest_before)
+                self.assertEqual((self.work / capture["html_path"]).read_text(), HTML)
+
+    def test_enrichment_reclassifies_legacy_no_title_html(self):
+        cache = {URL: {"status": "no_title", "html": HTML}}
+        SCHOLAR.enrich_cache_from_html(cache)
+        self.assertEqual(cache[URL]["status"], "ok")
+        self.assertEqual(cache[URL]["title"], "Example Person")
+
+    def test_replay_preserves_http_failures_and_checks_block_markers(self):
+        cases = (
+            ("http_error", 403, HTML, "http_error"),
+            ("parse_error", 503, HTML, "parse_error"),
+            ("no_title", 200, HTML + "unusual traffic", "blocked"),
+            ("blocked", 200, HTML + "unusual traffic", "blocked"),
+            ("ok", 200, HTML + "unusual traffic", "blocked"),
+            ("no_title", 200, "<html>Still no name</html>", "no_title"),
+        )
+        for index, (status, code, body, expected) in enumerate(cases):
+            with self.subTest(status=status, code=code):
+                self.cache = self.work / f"classified-{index}.json"
+                self.store().save(URL, {"status": status, "status_code": code, "html": body})
+                with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=AssertionError("network")):
+                    entry = self.run_crawler("--rebuild-cache")
+                self.assertEqual(entry["status"], expected)
+
+    def test_http_failure_remains_failed_after_parser_exception_and_recovery(self):
+        self.store().save(URL, {"status": "http_error", "status_code": 503, "html": HTML})
+        with patch.object(SCHOLAR.urllib.request, "urlopen", side_effect=AssertionError("network")):
+            with patch.object(SCHOLAR, "parse_profile_html", side_effect=ValueError("parser bug")), contextlib.redirect_stderr(io.StringIO()):
+                failed = self.run_crawler("--rebuild-cache")
+            self.assertEqual(failed["status"], "http_error")
+            repaired_parser = self.run_crawler("--rebuild-cache")
+            self.assertEqual(repaired_parser["status"], "http_error")
+
 
 if __name__ == "__main__":
     unittest.main()
