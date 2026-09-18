@@ -216,7 +216,10 @@ def can_reclassify(entry: dict[str, Any]) -> bool:
 
 def retain_result(cache: dict[str, Any], url: str, result: dict[str, Any]) -> None:
     previous = cache.get(url)
-    if previous and previous.get("status") == "ok" and result.get("status") != "ok":
+    if previous and result.get("status") != "ok" and (
+        previous.get("status") == "ok"
+        or (previous.get("status") == "parse_error" and has_html(previous) and not has_html(result))
+    ):
         previous["last_fetch_error"] = result
     else:
         cache[url] = result.copy()
@@ -721,7 +724,8 @@ def enrich_cache_from_html(cache: dict[str, Any], store: CaptureStore | None = N
         if can_reclassify(cached):
             cached["status"] = "blocked" if is_blocked_page(body) else "ok" if parsed.get("title") else "no_title"
             cached.pop("error", None)
-        if parsed.get("title"):
+            cached["title"] = parsed.get("title", "")
+        elif parsed.get("title"):
             cached["title"] = parsed["title"]
         cached["affiliation"] = parsed.get("affiliation", "")
         cached["interests"] = parsed.get("interests", [])
