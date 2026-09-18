@@ -8,7 +8,8 @@ The script is intentionally conservative:
 - each uncached request waits --delay seconds, plus optional --delay-jitter
 - every jittered batch of uncached requests, the script pauses for --batch-pause seconds, plus optional jitter
 - transient fetch failures are retried with exponential backoff
-- cache and report files are written after every request so runs can be resumed
+- raw response files and a manifest retain every attempt, including retries
+- the derived cache and report can be rebuilt offline from those captures
 
 By default, the script only writes local cache and report output.
 Pass --output to explicitly export enriched profile rows to an application CSV.
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import html
 import json
 import random
@@ -28,6 +30,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -41,7 +44,7 @@ DEFAULT_REPORT = CRAWLER_ROOT / ".cache" / "google-scholar-profile-report.json"
 SUFFIXES = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv"}
 PARTICLES = {"al", "bin", "da", "de", "del", "den", "der", "di", "du", "la", "le", "van", "von"}
 TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
-HTML_REQUIRED_STATUSES = {"ok", "blocked", "http_error", "no_title"}
+HTML_REQUIRED_STATUSES = {"ok", "blocked", "http_error", "no_title", "parse_error"}
 PROFILE_CSV_COLUMNS = [
     "name",
     "profile",
@@ -155,6 +158,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-write-csv", action="store_true", help="Skip writing the enriched Scholar profile CSV.")
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="JSON cache path.")
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT, help="JSON report path.")
+    parser.add_argument("--page-size", type=int, choices=(20, 100), default=100, help="Publications requested on the first page (default: 100); no additional pages are fetched.")
+    parser.add_argument("--rebuild-cache", action="store_true", help="Rebuild the derived cache from the capture manifest, without network requests.")
     parser.add_argument("--delay", type=float, default=5.0, help="Base seconds to wait between uncached requests.")
     parser.add_argument("--delay-jitter", type=float, default=2.0, help="Random extra seconds added to --delay.")
     parser.add_argument("--batch-size", type=int, default=25, help="Base uncached requests per batch.")
@@ -172,7 +177,10 @@ def parse_args() -> argparse.Namespace:
         help="Refetch cached URLs whose status matches this value. May be passed multiple times.",
     )
     parser.add_argument("--refresh", action="store_true", help="Refetch URLs even when cached.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.rebuild_cache and (args.refresh or args.retry_status):
+        parser.error("--rebuild-cache cannot be combined with --refresh or --retry-status")
+    return args
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -186,6 +194,118 @@ def load_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def has_html(entry: dict[str, Any]) -> bool:
+    return bool(entry.get("html") or entry.get("html_path") and not entry.get("html_error"))
+
+
+def retain_result(cache: dict[str, Any], url: str, result: dict[str, Any]) -> None:
+    previous = cache.get(url)
+    if previous and previous.get("status") == "ok" and result.get("status") != "ok":
+        previous["last_fetch_error"] = result
+    else:
+        cache[url] = result.copy()
+
+
+class CaptureStore:
+    """Immutable response bodies and an atomic manifest; paths are cache-relative."""
+
+    def __init__(self, cache_path: Path) -> None:
+        self.base = cache_path.parent
+        self.root = self.base / (cache_path.stem + "-captures")
+        self.manifest_path = self.root / "manifest.json"
+        self.manifest = load_json(self.manifest_path, {"version": 1, "captures": []})
+        if self.manifest.get("version") != 1:
+            raise ValueError(f"Unsupported capture manifest: {self.manifest_path}")
+        self.by_id = {entry["capture_id"]: entry for entry in self.manifest["captures"]}
+
+    def save(self, url: str, result: dict[str, Any], *, legacy: bool = False) -> dict[str, Any]:
+        entry = result.copy()
+        raw = entry.pop("_raw_body", None)
+        body = entry.pop("html", "")
+        if raw is None and body:
+            # Legacy caches preserve decoded text, not the original response bytes.
+            raw = body.encode("utf-8")
+            entry["encoding"] = "utf-8"
+            entry["body_source"] = "legacy-decoded-html"
+        elif raw is not None:
+            entry["body_source"] = "http-response-bytes"
+        entry["profile_url"] = canonical_scholar_url(url)
+        entry.setdefault("requested_url", url)
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(entry["requested_url"]).query)
+        entry.setdefault("cstart", int(query.get("cstart", [0])[0]))
+        entry.setdefault("pagesize", int(query.get("pagesize", [20 if legacy else 100])[0]))
+        # Deterministic migration IDs let an interrupted migration resume without
+        # duplicating old captures or making them newer than subsequent fetches.
+        entry["capture_id"] = (
+            hashlib.sha256(json.dumps({"url": url, "entry": result}, sort_keys=True).encode()).hexdigest()
+            if legacy else uuid.uuid4().hex
+        )
+        if entry["capture_id"] in self.by_id:
+            return {**entry, **self.by_id[entry["capture_id"]]}
+        profile_id = hashlib.sha256(entry["profile_url"].encode()).hexdigest()[:16]
+        timestamp = re.sub(r"[^0-9A-Za-z]", "", entry.get("fetched_at", "unknown"))
+        directory = self.root / profile_id
+        directory.mkdir(parents=True, exist_ok=True)
+        if raw is not None:
+            path = directory / f"{timestamp}-p{entry['cstart']}-{entry['capture_id']}.html"
+            if path.exists() and path.read_bytes() != raw:
+                # Keep even a partial orphan left before a manifest write failed.
+                path = path.with_name(f"{path.stem}-{uuid.uuid4().hex}.html")
+            if not path.exists():
+                with path.open("xb") as stream:
+                    stream.write(raw)
+            entry["html_path"] = str(path.relative_to(self.base))
+            entry["html_sha256"] = hashlib.sha256(raw).hexdigest()
+            entry["html_bytes"] = len(raw)
+        fields = (
+            "capture_id", "profile_url", "requested_url", "final_url", "fetched_at",
+            "status", "status_code", "error", "encoding", "response_headers",
+            "cstart", "pagesize", "html_path", "html_sha256", "html_bytes", "body_source",
+        )
+        capture = {key: entry[key] for key in fields if key in entry}
+        self.manifest["captures"].append(capture)
+        self.by_id[entry["capture_id"]] = capture
+        atomic_write_json(self.manifest_path, self.manifest)
+        return entry
+
+    def migrate(self, cache: dict[str, Any]) -> None:
+        for url, entry in list(cache.items()):
+            failure = entry.pop("last_fetch_error", None)
+            if not entry.get("capture_id"):
+                entry = self.save(url, entry, legacy=True)
+                cache[url] = entry
+            if failure is not None:
+                if not failure.get("capture_id"):
+                    failure = self.save(url, failure, legacy=True)
+                entry["last_fetch_error"] = failure
+
+    def replay(self, cache: dict[str, Any]) -> None:
+        # Replaying also recovers attempts saved before an interrupted cache write.
+        recovered: dict[str, Any] = {}
+        for capture in self.manifest["captures"]:
+            retain_result(recovered, capture["profile_url"], capture.copy())
+        for url, entry in recovered.items():
+            previous = cache.get(url, {})
+            if previous.get("capture_id") == entry["capture_id"]:
+                # Preserve derived fields when a capture is missing or unreadable.
+                previous = {key: value for key, value in previous.items() if key != "last_fetch_error"}
+                recovered[url] = {**previous, **entry}
+        cache.update(recovered)
+
+    def read_html(self, entry: dict[str, Any]) -> str:
+        if entry.get("html"):
+            return entry["html"]
+        if not entry.get("html_path"):
+            return ""
+        path = (self.base / entry["html_path"]).resolve()
+        if not path.is_relative_to(self.root.resolve()):
+            raise ValueError(f"Capture path is outside {self.root}: {path}")
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != entry["html_sha256"]:
+            raise ValueError(f"Capture checksum mismatch: {path}")
+        return raw.decode(entry.get("encoding") or "latin1", errors="replace")
 
 
 def load_rows(data_path: Path) -> list[dict[str, Any]]:
@@ -226,7 +346,7 @@ def normalize_cache_keys(cache: dict[str, Any]) -> dict[str, Any]:
     for url, item in cache.items():
         key = canonical_scholar_url(url)
         existing = normalized.get(key)
-        if existing is None or (not existing.get("html") and item.get("html")):
+        if existing is None or (not has_html(existing) and has_html(item)):
             normalized[key] = item
     return normalized
 
@@ -409,25 +529,12 @@ def decode_body(body: bytes, headers: Any) -> str:
     return body.decode(charset or "latin1", errors="replace")
 
 
-def read_error_body(error: urllib.error.HTTPError) -> str:
-    try:
-        return decode_body(error.read(), error.headers)
-    except (ConnectionError, OSError) as read_error:
-        return f"Could not read HTTP error body: {read_error}"
-
-
 def should_retry(result: dict[str, Any]) -> bool:
     status = result.get("status")
     return (
         status in {"url_error", "timeout"}
         or status == "http_error"
         and result.get("status_code") in TRANSIENT_HTTP_STATUS
-    )
-
-
-def is_transient_failure(result: dict[str, Any]) -> bool:
-    return result.get("status") in {"url_error", "timeout"} or (
-        result.get("status") == "http_error" and result.get("status_code") in TRANSIENT_HTTP_STATUS
     )
 
 
@@ -441,7 +548,7 @@ def batch_target(base: int, jitter: int) -> int:
     return max(1, base + random.randint(-jitter, jitter))
 
 
-def fetch_profile_once(url: str) -> dict[str, Any]:
+def fetch_profile_once(url: str, page_size: int = 100) -> dict[str, Any]:
     parsed_url = urllib.parse.urlparse(url)
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
         return {
@@ -453,8 +560,11 @@ def fetch_profile_once(url: str) -> dict[str, Any]:
             "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
 
+    query = urllib.parse.parse_qs(parsed_url.query)
+    query.update({"pagesize": [str(page_size)], "cstart": ["0"]})
+    requested_url = urllib.parse.urlunparse(parsed_url._replace(query=urllib.parse.urlencode(query, doseq=True)))
     request = urllib.request.Request(
-        url,
+        requested_url,
         headers={
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -464,20 +574,32 @@ def fetch_profile_once(url: str) -> dict[str, Any]:
         },
     )
     fetched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    metadata: dict[str, Any] = {"requested_url": requested_url, "fetched_at": fetched_at}
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            body = decode_body(response.read(), response.headers)
+            raw = response.read()
+            metadata.update(response_metadata(raw, response.headers, response.geturl()))
+            body = decode_body(raw, response.headers)
             status_code = response.status
     except urllib.error.HTTPError as error:
+        try:
+            raw = error.read()
+            metadata.update(response_metadata(raw, error.headers, error.geturl()))
+            body = decode_body(raw, error.headers)
+        except (ConnectionError, OSError) as read_error:
+            body = ""
+            metadata["error"] = f"Could not read HTTP error body: {read_error}"
         return {
+            **metadata,
             "status": "http_error",
             "status_code": error.code,
             "title": "",
-            "html": read_error_body(error),
+            "html": body,
             "fetched_at": fetched_at,
         }
     except urllib.error.URLError as error:
         return {
+            **metadata,
             "status": "url_error",
             "error": str(error.reason),
             "title": "",
@@ -485,9 +607,14 @@ def fetch_profile_once(url: str) -> dict[str, Any]:
             "fetched_at": fetched_at,
         }
     except (TimeoutError, socket.timeout):
-        return {"status": "timeout", "title": "", "html": "", "fetched_at": fetched_at}
+        return {**metadata, "status": "timeout", "title": "", "html": ""}
 
-    parsed = parse_profile_html(body)
+    try:
+        parsed = parse_profile_html(body)
+    except Exception as error:
+        # A parser bug must not discard a successfully downloaded response.
+        return {**metadata, "status": "parse_error", "status_code": status_code,
+                "html": body, "error": f"{type(error).__name__}: {error}"}
     title = parsed.get("title", "")
     if is_blocked_page(body):
         status = "blocked"
@@ -497,6 +624,7 @@ def fetch_profile_once(url: str) -> dict[str, Any]:
         status = "ok"
 
     return {
+        **metadata,
         "status": status,
         "status_code": status_code,
         "title": title,
@@ -515,10 +643,22 @@ def fetch_profile_once(url: str) -> dict[str, Any]:
     }
 
 
-def fetch_profile(url: str, max_retries: int, backoff: float, backoff_jitter: float) -> dict[str, Any]:
+def response_metadata(raw: bytes, headers: Any, final_url: str) -> dict[str, Any]:
+    return {
+        "_raw_body": raw,
+        "encoding": (headers.get_content_charset() if headers else None) or "latin1",
+        "response_headers": dict(headers.items()) if headers else {},
+        "final_url": final_url,
+    }
+
+
+def fetch_profile(url: str, max_retries: int, backoff: float, backoff_jitter: float,
+                  *, page_size: int = 100, capture_store: CaptureStore | None = None) -> dict[str, Any]:
     attempts = 0
     while True:
-        result = fetch_profile_once(url)
+        result = fetch_profile_once(url, page_size)
+        if capture_store is not None:
+            result = capture_store.save(url, result)
         if attempts >= max_retries or not should_retry(result):
             if attempts:
                 result["attempts"] = attempts + 1
@@ -535,15 +675,24 @@ def fetch_profile(url: str, max_retries: int, backoff: float, backoff_jitter: fl
 
 
 def needs_html_refetch(cached: dict[str, Any]) -> bool:
-    return cached.get("status") in HTML_REQUIRED_STATUSES and not cached.get("html")
+    return cached.get("status") in HTML_REQUIRED_STATUSES and not has_html(cached)
 
 
-def enrich_cache_from_html(cache: dict[str, Any]) -> None:
+def enrich_cache_from_html(cache: dict[str, Any], store: CaptureStore | None = None) -> None:
     for cached in cache.values():
-        body = cached.get("html")
+        cached.pop("html_error", None)
+        try:
+            body = store.read_html(cached) if store else cached.get("html")
+        except (OSError, ValueError, KeyError, LookupError) as error:
+            cached["html_error"] = str(error)
+            print(f"Warning: {error}", file=sys.stderr)
+            continue
         if not body:
             continue
         parsed = parse_profile_html(body)
+        if cached.get("status") == "parse_error":
+            cached["status"] = "blocked" if is_blocked_page(body) else "ok" if parsed.get("title") else "no_title"
+            cached.pop("error", None)
         if parsed.get("title"):
             cached["title"] = parsed["title"]
         cached["affiliation"] = parsed.get("affiliation", "")
@@ -596,7 +745,10 @@ def build_report(profiles: list[ScholarProfile], cache: dict[str, Any]) -> dict[
                 "i10_index_since_5y_ago": cached.get("i10_index_since_5y_ago", ""),
                 "first_citation_year": cached.get("first_citation_year", ""),
                 "citation_by_year": cached.get("citation_by_year", {}),
-                "html_cached": bool(cached.get("html")),
+                "html_cached": has_html(cached),
+                "html_path": cached.get("html_path"),
+                "html_error": cached.get("html_error"),
+                "last_fetch_error": cached.get("last_fetch_error"),
                 "match": match,
                 "fetched_at": cached.get("fetched_at"),
             }
@@ -608,7 +760,7 @@ def build_report(profiles: list[ScholarProfile], cache: dict[str, Any]) -> dict[
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "total_profiles": len(profiles),
         "cached_profiles": sum(1 for profile in profiles if profile.url in cache),
-        "html_cached_profiles": sum(1 for profile in profiles if cache.get(profile.url, {}).get("html")),
+        "html_cached_profiles": sum(1 for profile in profiles if has_html(cache.get(profile.url, {}))),
         "incomplete_cached_profiles": sum(1 for profile in profiles if needs_html_refetch(cache.get(profile.url, {}))),
         "status_counts": status_counts,
         "mismatch_count": len(mismatches),
@@ -689,8 +841,14 @@ def main() -> int:
     args = parse_args()
     rows = load_rows(args.data)
     profiles = unique_profiles(rows)
-    cache: dict[str, Any] = normalize_cache_keys(load_json(args.cache, {}))
-    enrich_cache_from_html(cache)
+    cache: dict[str, Any] = {} if args.rebuild_cache else normalize_cache_keys(load_json(args.cache, {}))
+    store = CaptureStore(args.cache)
+    if args.rebuild_cache and not store.manifest_path.exists():
+        raise ValueError(f"Cannot rebuild without a capture manifest: {store.manifest_path}")
+    if not args.rebuild_cache:
+        store.migrate(cache)
+    store.replay(cache)
+    enrich_cache_from_html(cache, store)
     retry_statuses = set(args.retry_status)
 
     new_requests = 0
@@ -698,6 +856,8 @@ def main() -> int:
     current_batch_target = batch_target(args.batch_size, args.batch_size_jitter)
 
     for position, profile in enumerate(profiles, start=1):
+        if args.rebuild_cache:
+            break
         cached = cache.get(profile.url)
         refetch_status = bool(cached and cached.get("status") in retry_statuses)
         incomplete_cache = bool(cached and needs_html_refetch(cached))
@@ -715,12 +875,11 @@ def main() -> int:
             current_batch_target = batch_target(args.batch_size, args.batch_size_jitter)
 
         print(f"[{position}/{len(profiles)}] fetching {profile.name}: {profile.url}", flush=True)
-        result = fetch_profile(profile.url, args.max_retries, args.backoff, args.backoff_jitter)
-        if cached and is_transient_failure(result):
-            cached["last_fetch_error"] = result
-            cache[profile.url] = cached
-        else:
-            cache[profile.url] = result
+        result = fetch_profile(profile.url, args.max_retries, args.backoff, args.backoff_jitter,
+                               page_size=args.page_size, capture_store=store)
+        if not result.get("capture_id"):
+            result = store.save(profile.url, result)
+        retain_result(cache, profile.url, result)
         new_requests += 1
         batch_requests += 1
 

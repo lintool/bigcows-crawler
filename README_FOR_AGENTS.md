@@ -34,7 +34,7 @@ ACM optional-field comparison semantics are documented under [Reports and data r
 Default artifacts live under this repository's Git-ignored `.cache/`.
 Each source's section below documents its filenames and schemas.
 Profile cache indexes are URL-keyed JSON containing parsed fields, status, and timestamps.
-ACM, Scholar and HTTP DBLP entries embed HTML; DBLP Safari entries reference separate HTML files through `html_path` and `html_sha256`.
+ACM and HTTP DBLP entries embed HTML; Scholar and DBLP Safari entries reference separate HTML files through `html_path` and `html_sha256`.
 Different applications can consume the same captured profiles.
 ACM manifests bind each crawl to one input checksum; use read-only comparison for another application's CSV, or a separate crawl for different fetch inputs.
 
@@ -532,9 +532,10 @@ The script:
 - reads profile rows from the required `--data` input;
 - extracts unique non-empty `google_scholar_profile` URLs;
 - canonicalizes Scholar URLs to `https://scholar.google.com/citations?user=...`;
-- fetches each Scholar profile page conservatively;
-- caches the complete fetched HTML page for reuse;
-- treats cached fetchable entries without `html` as incomplete and refetchable;
+- requests up to 100 publications on the first page of each profile, with unchanged pacing and no automatic pagination;
+- retains original response bytes in separate HTML files and records every attempt in a capture manifest;
+- migrates legacy embedded HTML locally and reparses saved captures without network access;
+- treats missing or checksum-invalid captures as incomplete and refetchable;
 - extracts the Scholar page title, affiliation, keyword interests, citation count, h-index, i10-index, and first citation year;
 - compares the expected ACM fellow name against the Scholar title;
 - writes a JSON cache and a JSON report;
@@ -597,8 +598,10 @@ From the repo root, the default cache path is:
 .cache/google-scholar-profile-cache.json
 ```
 
-The cache is a JSON object keyed by Scholar profile URL.
-Each value contains fields such as:
+The cache is a derived JSON object keyed by canonical Scholar profile URL.
+Raw captures live beside it under `<cache-stem>-captures/`; the default is `.cache/google-scholar-profile-cache-captures/`.
+Custom `--cache` paths get their own capture directory.
+Each cache value contains parsed fields and a reference to its selected capture, such as:
 
 ```json
 {
@@ -615,7 +618,15 @@ Each value contains fields such as:
   "i10_index_since_5y_ago": "56",
   "first_citation_year": "2005",
   "citation_by_year": {"2005": 126, "2006": 148},
-  "html": "<complete fetched HTML page>",
+  "capture_id": "unique-capture-id",
+  "requested_url": "https://scholar.google.com/citations?user=example&pagesize=100&cstart=0",
+  "cstart": 0,
+  "pagesize": 100,
+  "html_path": "google-scholar-profile-cache-captures/profile-hash/timestamp-p0-capture-id.html",
+  "html_sha256": "sha256-of-response-bytes",
+  "html_bytes": 123456,
+  "encoding": "utf-8",
+  "body_source": "http-response-bytes",
   "fetched_at": "YYYY-MM-DDTHH:MM:SSZ"
 }
 ```
@@ -629,6 +640,7 @@ Other possible `status` values include:
 - `invalid_url`: URL is not HTTP/HTTPS.
 - `blocked`: fetched page appears to be a Google block/interstitial page.
 - `no_title`: page fetched but no usable title was found.
+- `parse_error`: a parser exception occurred; the downloaded body is retained for reprocessing after the parser is fixed.
 
 The cache is intentionally idempotent:
 
@@ -637,12 +649,51 @@ The cache is intentionally idempotent:
 - interrupted runs can be resumed safely because the cache is written after every request.
 
 Ordinary resume skips cached failures unless they are explicitly selected with `--retry-status` or need missing HTML refetched.
-Statuses `ok`, `blocked`, `http_error` and `no_title` require HTML; entries with one of those statuses and no HTML are refetched even without `--retry-status`.
-A transient failure can preserve an older entry and attach the failed result as `last_fetch_error`.
-Inspect that cache field directly: the report does not include it, and the retained entry can still have status `ok` and an older `fetched_at`.
+Statuses `ok`, `blocked`, `http_error`, `no_title` and `parse_error` require HTML; entries with one of those statuses and missing or invalid captures are refetched even without `--retry-status`.
+Every unsuccessful refresh preserves an existing successful entry and attaches the latest failed result as `last_fetch_error`.
+The report includes that failure; the retained entry can still have status `ok` and an older `fetched_at`.
 Selecting `--retry-status` uses the retained top-level status, not `last_fetch_error.status`; use a targeted input with `--refresh` when explicitly retrying such URLs, after reviewing the failure.
 
-The cache stores complete HTML, so it can become large.
+#### Raw Captures and Offline Reprocessing
+
+`<cache-stem>-captures/manifest.json` is a versioned object with an ordered `captures` array.
+Each record includes a capture ID, canonical profile URL, actual requested URL, final URL when available, fetch timestamp, status, HTTP status when available, requested `pagesize` and `cstart`, and response headers and decoding charset when available.
+Responses with bodies also record their file path, SHA-256 checksum, byte count, and `body_source`.
+Paths are relative to the cache's parent directory; keep the capture directory alongside the cache when moving or backing up artifacts.
+Capture filenames include a profile hash, timestamp, page offset, and unique ID, so repeated requests never overwrite earlier captures.
+The crawler saves each response body and atomically updates the manifest before updating the derived cache, including intermediate retries and failed refreshes.
+Network failures without a response body still get manifest records, without invented HTML files.
+The manifest recovers attempts interrupted before the cache write; concurrent writers to the same cache are not supported.
+
+Legacy embedded HTML is migrated automatically on the next invocation, including `--limit-new 0`, without fetching anything.
+These files contain the original cached text re-encoded as UTF-8 and are labeled `body_source: legacy-decoded-html`; the original HTTP bytes and headers cannot be recovered from the old cache.
+Existing crawl timestamps are preserved, and migration is idempotent, including after interruption.
+Existing complete 20-row captures remain reusable; changing `--page-size` does not invalidate them or force a recrawl.
+Use a targeted input with `--refresh --limit-new N` to upgrade selected profiles gradually.
+`--page-size 20` restores the previous requested page size for new fetches.
+
+Normal runs reparse the selected saved HTML into the profile-statistics cache before fetching missing profiles.
+Publication rows remain in the raw HTML for later extraction; the profile CSV schema is unchanged.
+To migrate or reprocess the current cache without any requests:
+
+```bash
+python scripts/cache_google_scholar_profiles.py --data path/to/input.csv --limit-new 0
+```
+
+To rebuild a missing, damaged, or outdated derived cache from its existing manifest:
+
+```bash
+python scripts/cache_google_scholar_profiles.py --data path/to/input.csv --rebuild-cache
+python scripts/cache_google_scholar_profiles.py --data path/to/input.csv --rebuild-cache --output path/to/scholar-profiles.csv
+```
+
+`--rebuild-cache` makes no network requests, requires an existing manifest, and rejects `--refresh` and `--retry-status`.
+It selects the last successful capture for each profile, retains later failures as `last_fetch_error`, and runs the current parser to recreate derived fields.
+All historical responses remain available through the manifest for custom analysis.
+Missing or checksum-invalid selected files produce warnings and `html_error` report fields; a normal online resume attempts to replace these incomplete captures.
+A metadata-only legacy entry has no raw body from which to rebuild parsed fields.
+
+The raw capture history grows over time, while the derived cache contains no embedded HTML.
 `.cache/` is local-only and ignored by Git.
 If `.cache/` is missing, the crawler creates it automatically when it writes the cache/report.
 A cache-only run with `--limit-new 0` creates an empty cache plus a report without downloading pages.
@@ -687,6 +738,10 @@ Each report entry includes:
 - `i10_index_since_5y_ago`: recent Scholar i10-index.
 - `first_citation_year`: earliest year shown in Scholar's `Citations per year` chart.
 - `citation_by_year`: JSON object mapping year strings to citation counts from Scholar's `Citations per year` chart.
+- `html_cached`: whether the selected capture is available and passed integrity checks.
+- `html_path`: cache-relative path to the selected raw capture.
+- `html_error`: capture read or checksum failure, when present.
+- `last_fetch_error`: latest unsuccessful refresh retained alongside an earlier success.
 - `match`: `true`, `false`, or `null`.
 - `fetched_at`: cache timestamp, when available.
 
@@ -721,7 +776,7 @@ The crawler is deliberately slow:
 
 Google Scholar default behavior is therefore:
 
-1. Fetch up to 25 uncached profiles.
+1. Fetch up to 25 uncached profiles, requesting the first 100 publications on each page.
 2. Wait 5 to 7 seconds after each fetch.
 3. Pause for 120 to 150 seconds after the batch.
 4. Write cache and report after every request.
