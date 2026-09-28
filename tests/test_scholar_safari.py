@@ -80,6 +80,34 @@ class SafariTests(unittest.TestCase):
                 self.assertNotIn('last_fetch_error', recovered)
                 self.assertNotEqual(recovered['capture_id'], good['capture_id'])
 
+    def test_rebuild_reclassifies_safari_failures_before_selection(self):
+        for old_status in ('validation_error', 'redirect_review', 'browser_error'):
+            for later_failure in (False, True):
+                with self.subTest(status=old_status, later_failure=later_failure):
+                    self.cache = self.work / f'{old_status}-{later_failure}.json'
+                    store = self.store()
+                    metadata = dict(requested_url=REQUEST, final_url=REQUEST,
+                                    fetch_method='safari-applescript', status_code=None)
+                    store.save(URL, dict(metadata, status='ok', html=page()))
+                    recovered = store.save(URL, dict(metadata, status=old_status,
+                                                     html=page().replace('Paper', 'New Paper')))
+                    if later_failure:
+                        failure = store.save(URL, dict(metadata, status='browser_error', html=''))
+                    manifest_before = store.manifest_path.read_bytes()
+                    body_before = (self.work / recovered['html_path']).read_bytes()
+                    with patch.object(DBLP, 'open_window', side_effect=AssertionError('Safari')), \
+                         patch.object(SCHOLAR.urllib.request, 'urlopen', side_effect=AssertionError('HTTP')):
+                        entry = self.run_crawler('--rebuild-cache')
+                    self.assertEqual(entry['capture_id'], recovered['capture_id'])
+                    self.assertEqual(entry['status'], 'ok')
+                    self.assertEqual(entry['publication_count'], 100)
+                    if later_failure:
+                        self.assertEqual(entry['last_fetch_error']['capture_id'], failure['capture_id'])
+                    else:
+                        self.assertNotIn('last_fetch_error', entry)
+                    self.assertEqual(store.manifest_path.read_bytes(), manifest_before)
+                    self.assertEqual((self.work / recovered['html_path']).read_bytes(), body_before)
+
     def test_default_transport(self):
         with patch.object(sys, 'argv', ['crawler', '--data', str(self.source)]):
             args = SCHOLAR.parse_args()

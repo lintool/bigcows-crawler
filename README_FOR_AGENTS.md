@@ -538,7 +538,8 @@ This verifies first-page coverage, not publication authorship or deduplication.
 
 Safari captures have `fetch_method: safari-applescript`, `body_source: safari-page-source`, UTF-8 encoding, and `status_code: null`.
 They retain Safari's page source, not original HTTP response bytes or headers.
-The manifest preserves transport provenance, and offline replay reapplies Safari URL and coverage validation.
+The manifest preserves transport provenance, and offline replay reapplies Safari URL and coverage validation to every body-backed Safari candidate before selecting the latest successful capture.
+Previously rejected captures can therefore recover after validator fixes without refetching or rewriting the original manifest.
 Existing HTTP captures and cache keys remain compatible; switching transports does not force a refresh.
 Safari stops after saving any failed capture, including `blocked`, `redirect_review`, `validation_error`, `no_title`, `parse_error`, or `browser_error`, without retrying it within the invocation.
 `--timeout` controls page loading (default 60 seconds); browser or permission failures require inspection rather than automatic retries.

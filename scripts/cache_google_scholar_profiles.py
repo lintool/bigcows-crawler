@@ -310,9 +310,11 @@ class CaptureStore:
         recovered: dict[str, Any] = {}
         for capture in self.manifest["captures"]:
             candidate = capture.copy()
-            if can_reclassify(candidate):
-                # A fixed parser may turn this historical response into the latest
-                # success, even if subsequent attempts failed without a body.
+            if can_reclassify(candidate) or (
+                candidate.get("fetch_method") == "safari-applescript" and has_html(candidate)
+            ):
+                # Reclassify body-backed Safari failures before choosing a capture:
+                # a fixed validator may now accept a previously rejected response.
                 enrich_cache_from_html({candidate["profile_url"]: candidate}, self)
             retain_result(recovered, candidate["profile_url"], candidate)
         for url, entry in recovered.items():
