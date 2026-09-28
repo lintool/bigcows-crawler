@@ -521,6 +521,30 @@ The CSRankings crawler defaults are:
 
 ## Google Scholar Profile Crawler
 
+Live fetching defaults to regular Safari on macOS (`--transport safari`), using a dedicated window and AppleScript, like the ACM and DBLP Safari crawlers.
+Safari supplies its own browser headers and session; the crawler does not inject a User-Agent or fall back to HTTP.
+macOS may require Automation permission for the terminal to control Safari; JavaScript from Apple Events is not required.
+The dedicated window opens lazily for the first fetch and closes on completion, failure, or interruption.
+`--limit-new 0` and `--rebuild-cache` remain browser-free and work off macOS.
+Use `--transport http` only to explicitly select the legacy urllib transport.
+
+Safari requests `hl=en&oi=ao&pagesize=100&cstart=0` by default, using the URL pattern verified in the browser checks.
+`--page-size 20` is still available; no extra pages are fetched.
+The transport clears the previous page before each navigation to prevent saving stale profile HTML.
+It validates the final Scholar user ID, complete HTML, profile identity markup, and publication-row count.
+A successful capture must contain the requested number of rows, or fewer rows with the Show More button disabled.
+`publication_count` and `publications_exhausted` are derived from the captured HTML and included in the cache and report.
+This verifies first-page coverage, not publication authorship or deduplication.
+
+Safari captures have `fetch_method: safari-applescript`, `body_source: safari-page-source`, UTF-8 encoding, and `status_code: null`.
+They retain Safari's page source, not original HTTP response bytes or headers.
+The manifest preserves transport provenance, and offline replay reapplies Safari URL and coverage validation to every body-backed Safari candidate before selecting the latest successful capture.
+Previously rejected captures can therefore recover after validator fixes without refetching or rewriting the original manifest.
+Existing HTTP captures and cache keys remain compatible; switching transports does not force a refresh.
+Safari stops after saving any failed capture, including `blocked`, `redirect_review`, `validation_error`, `no_title`, `parse_error`, or `browser_error`, without retrying it within the invocation.
+`--timeout` controls page loading (default 60 seconds); browser or permission failures require inspection rather than automatic retries.
+Use `--retry-status STATUS` to explicitly retry a saved failure after resolving its cause, including a failure retained under `last_fetch_error` beneath a successful capture.
+
 `scripts/cache_google_scholar_profiles.py` validates the `google_scholar_profile` URLs in the caller-supplied CSV:
 
 ```text
@@ -532,8 +556,8 @@ The script:
 - reads profile rows from the required `--data` input;
 - extracts unique non-empty `google_scholar_profile` URLs;
 - canonicalizes Scholar URLs to `https://scholar.google.com/citations?user=...`;
-- requests up to 100 publications on the first page of each profile, with unchanged pacing and no automatic pagination;
-- retains original response bytes in separate HTML files and records every attempt in a capture manifest;
+- requests up to 100 publications on the first page of each profile, with no automatic pagination;
+- retains Safari page source (or original response bytes with HTTP) in separate HTML files and records every attempt in a capture manifest;
 - migrates legacy embedded HTML locally and reparses saved captures without network access;
 - treats missing or checksum-invalid captures as incomplete and refetchable;
 - extracts the Scholar page title, affiliation, keyword interests, citation count, h-index, i10-index, and first citation year;
@@ -653,7 +677,7 @@ Statuses `ok`, `blocked`, `http_error`, `no_title` and `parse_error` require non
 Empty response files remain in the capture history but do not count toward `html_cached_profiles`.
 Every unsuccessful refresh preserves an existing successful entry and attaches the latest failed result as `last_fetch_error`.
 The report includes that failure; the retained entry can still have status `ok` and an older `fetched_at`.
-Selecting `--retry-status` uses the retained top-level status, not `last_fetch_error.status`; use a targeted input with `--refresh` when explicitly retrying such URLs, after reviewing the failure.
+Selecting `--retry-status` matches either the retained top-level status or `last_fetch_error.status`, so a failed refresh can be retried while its earlier successful capture remains available.
 
 #### Raw Captures and Offline Reprocessing
 
@@ -773,12 +797,12 @@ Some mismatches are harmless diacritic or formatting differences, such as `Urs H
 
 The crawler is deliberately slow:
 
-- `--delay` defaults to `5.0` base seconds between uncached requests.
-- `--delay-jitter` defaults to `2.0`; the actual delay is `delay + random(0, jitter)`.
+- `--delay` defaults to `15.0` base seconds between uncached requests.
+- `--delay-jitter` defaults to `5.0`; the actual delay is `delay + random(-jitter, jitter)`.
 - `--batch-size` defaults to `25` uncached requests.
 - `--batch-size-jitter` defaults to `0`; each batch target is randomized by plus/minus that many requests and clamped to at least 1.
-- `--batch-pause` defaults to `120.0` base seconds after each batch.
-- `--batch-pause-jitter` defaults to `30.0`; the actual pause is `batch-pause + random(0, jitter)`.
+- `--batch-pause` defaults to `75.0` base seconds after each batch.
+- `--batch-pause-jitter` defaults to `15.0`; the actual pause is `batch-pause + random(-jitter, jitter)`.
 - `--max-retries` defaults to `1` for transient failures.
 - `--backoff` defaults to `10.0` seconds with exponential growth between retries.
 - `--backoff-jitter` defaults to `5.0`; retry waits add `random(0, jitter)`.
@@ -788,28 +812,31 @@ The crawler is deliberately slow:
 Google Scholar default behavior is therefore:
 
 1. Fetch up to 25 uncached profiles, requesting the first 100 publications on each page.
-2. Wait 5 to 7 seconds after each fetch.
-3. Pause for 120 to 150 seconds after the batch.
+2. Wait 10 to 20 seconds between profiles.
+3. Pause for 60 to 90 seconds after the batch, replacing the per-profile delay.
 4. Write cache and report after every request.
 
 Because the Scholar crawler now requires full-page cache entries, older metadata-only entries are counted as `incomplete_cached_profiles` in the report and will be fetched again on a normal resume unless capped by `--limit-new`.
 
-If Google block markers appear while running the Scholar crawler, interrupt the run and inspect the saved response.
-The runner records blocking but does not stop automatically or return a failing exit status solely because profiles failed.
+If Google block markers appear in a fetched response, including an HTTP error body, the Scholar crawler saves the capture, cache and report, then stops with exit code 1 before requesting another profile or exporting a CSV.
+Detected block pages are not retried within the invocation; inspect the saved response before resuming after a cooldown.
+With the legacy HTTP transport, other profile failures can still finish with exit code 0; inspect the report rather than treating completion as successful coverage.
 After the block is resolved, resume with the same cache and use the [cache retry rules](#cache) for failed entries; a normal resume can otherwise skip the blocked URL.
 Batch counters and cooldown timing are local to each Scholar invocation, so repeated short runs do not preserve the batch cooldown as ACM and DBLP Safari runs do.
 
 ### Google Scholar Block Detection
 
 The script marks a fetched page as `blocked` when the page looks like a Google block/interstitial page.
-It checks for markers such as:
+The check runs before profile parsing for successful responses and also examines HTTP error bodies, retaining the original HTTP status code and response bytes.
+For example, an HTTP 429 unusual-traffic page is `blocked` with `status_code: 429`; a 429 response without block markers remains `http_error` under the existing transient-retry rules.
+It requires block-specific URL or HTML evidence:
 
-- `not a robot`
-- `unusual traffic`
-- `/sorry/`
-- `our systems have detected unusual traffic`
+- A final URL on `google.com`, `www.google.com` or `scholar.google.com` with a `/sorry/` path.
+- A form submitting to a Google `/sorry/` URL, including a relative form action.
+- A `g-recaptcha` div with a site key, or a Google/recaptcha.net challenge iframe.
 
-Do not flag every occurrence of the word `captcha`: Scholar profile pages can legitimately contain paper titles with that word.
+Publication text containing `not a robot`, `unusual traffic`, `/sorry/` or `captcha` alone does not mark a profile as blocked.
+The same evidence checks apply to HTTP responses, Safari captures and offline reclassification.
 
 ## Validation
 
