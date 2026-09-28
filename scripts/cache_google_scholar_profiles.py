@@ -544,14 +544,38 @@ def extract_title(body: str) -> str:
     return parse_profile_html(body).get("title", "")
 
 
-def is_blocked_page(body: str) -> bool:
-    lowered = body.lower()
-    return (
-        "not a robot" in lowered
-        or "unusual traffic" in lowered
-        or "/sorry/" in lowered
-        or "our systems have detected unusual traffic" in lowered
-    )
+def is_google_block_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    return (parsed.hostname in {"google.com", "www.google.com", "scholar.google.com"}
+            and parsed.path.startswith("/sorry/"))
+
+
+class BlockPageParser(HTMLParser):
+    """Recognize challenge controls, never phrases in publication text."""
+
+    def __init__(self):
+        super().__init__()
+        self.blocked = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form":
+            action = urllib.parse.urljoin("https://scholar.google.com/", attrs.get("action") or "")
+            self.blocked |= is_google_block_url(action)
+        if tag == "div" and "g-recaptcha" in (attrs.get("class") or "").split():
+            self.blocked |= bool(attrs.get("data-sitekey"))
+        if tag == "iframe":
+            source = urllib.parse.urlparse(attrs.get("src") or "")
+            self.blocked |= (source.hostname in {"www.google.com", "www.recaptcha.net"}
+                             and source.path.startswith("/recaptcha/"))
+
+
+def is_blocked_page(body: str, final_url: str = "") -> bool:
+    if is_google_block_url(final_url):
+        return True
+    parser = BlockPageParser()
+    parser.feed(body)
+    return parser.blocked
 
 
 def decode_body(body: bytes, headers: Any) -> str:
@@ -624,7 +648,7 @@ def fetch_profile_once(url: str, page_size: int = 100) -> dict[str, Any]:
             metadata["error"] = f"Could not read HTTP error body: {read_error}"
         return {
             **metadata,
-            "status": "blocked" if is_blocked_page(body) else "http_error",
+            "status": "blocked" if is_blocked_page(body, metadata.get("final_url", "")) else "http_error",
             "status_code": error.code,
             "title": "",
             "html": body,
@@ -642,7 +666,7 @@ def fetch_profile_once(url: str, page_size: int = 100) -> dict[str, Any]:
     except (TimeoutError, socket.timeout):
         return {**metadata, "status": "timeout", "title": "", "html": ""}
 
-    if is_blocked_page(body):
+    if is_blocked_page(body, metadata.get("final_url", "")):
         return {**metadata, "status": "blocked", "status_code": status_code,
                 "title": "", "html": body, "fetched_at": fetched_at}
 
@@ -702,7 +726,7 @@ def scholar_profile_id(url):
 
 def classify_safari(requested_url, final_url, body):
     # Safari exposes page source, not HTTP status or original wire bytes.
-    if is_blocked_page(body) or "/sorry/" in final_url:
+    if is_blocked_page(body, final_url):
         return {"status": "blocked", "title": ""}
     if not scholar_profile_id(requested_url) or scholar_profile_id(final_url) != scholar_profile_id(requested_url):
         return {"status": "redirect_review", "title": "", "error": "Final URL is not the requested Scholar profile."}
@@ -829,7 +853,7 @@ def enrich_cache_from_html(cache: dict[str, Any], store: CaptureStore | None = N
             print(f"Warning: could not parse {cached.get('html_path', 'cached HTML')}: {cached['error']}", file=sys.stderr)
             continue
         if can_reclassify(cached):
-            cached["status"] = "blocked" if is_blocked_page(body) else "ok" if parsed.get("title") else "no_title"
+            cached["status"] = "blocked" if is_blocked_page(body, cached.get("final_url", "")) else "ok" if parsed.get("title") else "no_title"
             cached.pop("error", None)
             cached["title"] = parsed.get("title", "")
         elif parsed.get("title"):
@@ -1012,7 +1036,8 @@ def crawl(args, cleanup) -> int:
         if args.rebuild_cache:
             break
         cached = cache.get(profile.url)
-        refetch_status = bool(cached and cached.get("status") in retry_statuses)
+        refetch_status = bool(cached and (cached.get("status") in retry_statuses
+                              or cached.get("last_fetch_error", {}).get("status") in retry_statuses))
         incomplete_cache = bool(cached and needs_html_refetch(cached))
         pending_retry = bool(cached and needs_retry_resume(cached))
         if cached and not args.refresh and not refetch_status and not incomplete_cache and not pending_retry:

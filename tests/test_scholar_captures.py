@@ -21,6 +21,8 @@ SCHOLAR = importlib.import_module("cache_google_scholar_profiles")
 URL = "https://scholar.google.com/citations?user=example"
 HTML = '<title>Example Person - Google Scholar</title><table id="gsc_rsb_st"><tr><td>Citations</td><td>123</td><td>12</td></tr></table>'
 
+BLOCK_HTML = '<html><form action="/sorry/index">Our systems have detected unusual traffic.</form></html>'
+
 
 class Response(io.BytesIO):
     status = 200
@@ -98,7 +100,7 @@ class ScholarCaptureTests(unittest.TestCase):
             good = self.run_crawler()
         headers = Message()
         for response in (
-            Response(b"<title>Sorry</title>unusual traffic"),
+            Response(BLOCK_HTML.encode()),
             Response(b"no title"),
             urllib.error.HTTPError(URL, 404, "missing", headers, io.BytesIO(b"not found")),
             TimeoutError(),
@@ -119,7 +121,7 @@ class ScholarCaptureTests(unittest.TestCase):
         self.assertEqual(len(self.store().manifest["captures"]), 6)
 
     def test_unusual_traffic_stops_before_retry_or_next_profile(self):
-        raw = b"<html>Our systems have detected unusual traffic from your computer network.</html>"
+        raw = BLOCK_HTML.encode()
         self.source.write_text("name,google_scholar_profile\nExample Person," + URL +
                                "\nSecond Person,https://scholar.google.com/citations?user=second\n")
         for code in (200, 429, 403):
@@ -140,8 +142,25 @@ class ScholarCaptureTests(unittest.TestCase):
                 self.assertEqual(report["status_counts"], {"blocked": 1, "missing": 1})
                 self.assertEqual(self.store().manifest["captures"][-1]["status"], "blocked")
 
+    def test_block_evidence_and_profile_text(self):
+        for body in ('<div class="g-recaptcha" data-sitekey="key"></div>',
+                     '<iframe src="https://www.google.com/recaptcha/api2/anchor"></iframe>',
+                     '<form action="https://www.google.com/sorry/index"></form>'):
+            self.assertTrue(SCHOLAR.is_blocked_page(body))
+        self.assertTrue(SCHOLAR.is_blocked_page('', 'https://www.google.com/sorry/index'))
+        self.assertFalse(SCHOLAR.is_blocked_page('Not a robot; unusual traffic; /sorry/; captcha'))
+        self.assertFalse(SCHOLAR.is_blocked_page('<form action="https://example.org/sorry/index"></form>'))
+        self.assertFalse(SCHOLAR.is_blocked_page('', URL + '&next=/sorry/'))
+        body = HTML + '<p>Not a robot: unusual traffic, /sorry/ and captcha</p>'
+        self.source.write_text('name,google_scholar_profile\nExample Person,' + URL +
+                               '\nSecond Person,' + URL + '2\n')
+        with patch.object(SCHOLAR.urllib.request, 'urlopen', side_effect=lambda *a, **k: Response(body.encode())) as fetch:
+            self.assertEqual(self.run_crawler()['status'], 'ok')
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(self.run_crawler('--rebuild-cache')['status'], 'ok')
+
     def test_block_check_does_not_depend_on_profile_parser(self):
-        with patch.object(SCHOLAR.urllib.request, "urlopen", return_value=Response(b"unusual traffic")), \
+        with patch.object(SCHOLAR.urllib.request, "urlopen", return_value=Response(BLOCK_HTML.encode())), \
              patch.object(SCHOLAR, "parse_profile_html", side_effect=ValueError("parser failed")):
             entry = self.run_crawler(expected_exit=1)
         self.assertEqual(entry["status"], "blocked")
@@ -413,9 +432,9 @@ class ScholarCaptureTests(unittest.TestCase):
         cases = (
             ("http_error", 403, HTML, "http_error"),
             ("parse_error", 503, HTML, "parse_error"),
-            ("no_title", 200, HTML + "unusual traffic", "blocked"),
-            ("blocked", 200, HTML + "unusual traffic", "blocked"),
-            ("ok", 200, HTML + "unusual traffic", "blocked"),
+            ("no_title", 200, BLOCK_HTML, "blocked"),
+            ("blocked", 200, BLOCK_HTML, "blocked"),
+            ("ok", 200, BLOCK_HTML, "blocked"),
             ("no_title", 200, "<html>Still no name</html>", "no_title"),
         )
         for index, (status, code, body, expected) in enumerate(cases):

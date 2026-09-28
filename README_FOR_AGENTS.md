@@ -542,7 +542,7 @@ The manifest preserves transport provenance, and offline replay reapplies Safari
 Existing HTTP captures and cache keys remain compatible; switching transports does not force a refresh.
 Safari stops after saving any failed capture, including `blocked`, `redirect_review`, `validation_error`, `no_title`, `parse_error`, or `browser_error`, without retrying it within the invocation.
 `--timeout` controls page loading (default 60 seconds); browser or permission failures require inspection rather than automatic retries.
-Use `--retry-status STATUS` to explicitly retry a saved failure after resolving its cause.
+Use `--retry-status STATUS` to explicitly retry a saved failure after resolving its cause, including a failure retained under `last_fetch_error` beneath a successful capture.
 
 `scripts/cache_google_scholar_profiles.py` validates the `google_scholar_profile` URLs in the caller-supplied CSV:
 
@@ -676,7 +676,7 @@ Statuses `ok`, `blocked`, `http_error`, `no_title` and `parse_error` require non
 Empty response files remain in the capture history but do not count toward `html_cached_profiles`.
 Every unsuccessful refresh preserves an existing successful entry and attaches the latest failed result as `last_fetch_error`.
 The report includes that failure; the retained entry can still have status `ok` and an older `fetched_at`.
-Selecting `--retry-status` uses the retained top-level status, not `last_fetch_error.status`; use a targeted input with `--refresh` when explicitly retrying such URLs, after reviewing the failure.
+Selecting `--retry-status` matches either the retained top-level status or `last_fetch_error.status`, so a failed refresh can be retried while its earlier successful capture remains available.
 
 #### Raw Captures and Offline Reprocessing
 
@@ -828,14 +828,14 @@ Batch counters and cooldown timing are local to each Scholar invocation, so repe
 The script marks a fetched page as `blocked` when the page looks like a Google block/interstitial page.
 The check runs before profile parsing for successful responses and also examines HTTP error bodies, retaining the original HTTP status code and response bytes.
 For example, an HTTP 429 unusual-traffic page is `blocked` with `status_code: 429`; a 429 response without block markers remains `http_error` under the existing transient-retry rules.
-It checks for markers such as:
+It requires block-specific URL or HTML evidence:
 
-- `not a robot`
-- `unusual traffic`
-- `/sorry/`
-- `our systems have detected unusual traffic`
+- A final URL on `google.com`, `www.google.com` or `scholar.google.com` with a `/sorry/` path.
+- A form submitting to a Google `/sorry/` URL, including a relative form action.
+- A `g-recaptcha` div with a site key, or a Google/recaptcha.net challenge iframe.
 
-Do not flag every occurrence of the word `captcha`: Scholar profile pages can legitimately contain paper titles with that word.
+Publication text containing `not a robot`, `unusual traffic`, `/sorry/` or `captcha` alone does not mark a profile as blocked.
+The same evidence checks apply to HTTP responses, Safari captures and offline reclassification.
 
 ## Validation
 

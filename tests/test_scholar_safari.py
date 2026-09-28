@@ -45,6 +45,41 @@ class SafariTests(unittest.TestCase):
         self.assertEqual(SCHOLAR.classify_safari(REQUEST, REQUEST, page().replace('gsc_prf_in', 'other'))['status'], 'no_title')
         self.assertEqual(SCHOLAR.classify_safari(REQUEST.replace('100', '20'), REQUEST, page(20))['status'], 'ok')
 
+    def test_publication_block_phrases_do_not_stop_crawl(self):
+        self.source.write_text('name,google_scholar_profile\nExample Person,' + URL +
+                               '\nSecond Person,' + URL + '2\n')
+        body = page().replace('Paper', 'Not a robot: unusual traffic, captcha and /sorry/')
+        outputs = [REQUEST + '\n' + body,
+                   REQUEST.replace('user=example', 'user=example2') + '\n' + body]
+        with patch.object(sys, 'platform', 'darwin'), patch.object(DBLP, 'open_window', return_value=42), \
+             patch.object(ACM, 'close_window'), patch.object(ACM, 'run_applescript', side_effect=outputs) as fetch:
+            entry = self.run_crawler()
+        self.assertEqual(entry['status'], 'ok')
+        self.assertEqual(fetch.call_count, 2)
+        with patch.object(DBLP, 'open_window', side_effect=AssertionError('Safari')):
+            self.assertEqual(self.run_crawler('--rebuild-cache')['status'], 'ok')
+
+    def test_retry_status_selects_retained_failure(self):
+        for failure in (captures.BLOCK_HTML, page(20)):
+            with self.subTest(failure=failure), patch.object(sys, 'platform', 'darwin'), \
+                 patch.object(DBLP, 'open_window', return_value=42), patch.object(ACM, 'close_window'):
+                with patch.object(ACM, 'run_applescript', return_value=REQUEST + '\n' + page()):
+                    good = self.run_crawler('--refresh')
+                with patch.object(ACM, 'run_applescript', return_value=REQUEST + '\n' + failure):
+                    failed = self.run_crawler('--refresh', expected_exit=1)
+                self.assertEqual(failed['status'], 'ok')
+                self.assertEqual(failed['capture_id'], good['capture_id'])
+                status = failed['last_fetch_error']['status']
+                with patch.object(ACM, 'run_applescript', side_effect=AssertionError('unselected retry')):
+                    skipped = self.run_crawler('--retry-status', 'browser_error')
+                self.assertEqual(skipped['last_fetch_error']['status'], status)
+                with patch.object(ACM, 'run_applescript', return_value=REQUEST + '\n' + page()) as fetch:
+                    recovered = self.run_crawler('--retry-status', status)
+                fetch.assert_called_once()
+                self.assertEqual(recovered['status'], 'ok')
+                self.assertNotIn('last_fetch_error', recovered)
+                self.assertNotEqual(recovered['capture_id'], good['capture_id'])
+
     def test_default_transport(self):
         with patch.object(sys, 'argv', ['crawler', '--data', str(self.source)]):
             args = SCHOLAR.parse_args()
@@ -82,7 +117,7 @@ class SafariTests(unittest.TestCase):
     def test_failures_stop_without_retry_and_survive_replay(self):
         self.source.write_text('name,google_scholar_profile\nExample Person,' + URL +
                                '\nSecond Person,' + URL + '2\n')
-        for final_url, body, expected in ((REQUEST, '<html>unusual traffic</html>', 'blocked'),
+        for final_url, body, expected in ((REQUEST, captures.BLOCK_HTML, 'blocked'),
                                            ('https://www.google.com/sorry/index', '<html>Sorry</html>', 'blocked'),
                                            (REQUEST, page(20), 'validation_error'),
                                            (URL + 'other', page(), 'redirect_review')):
