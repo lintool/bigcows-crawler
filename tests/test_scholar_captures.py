@@ -45,11 +45,11 @@ class ScholarCaptureTests(unittest.TestCase):
         self.source = self.work / "people.csv"
         self.source.write_text("name,google_scholar_profile\nExample Person," + URL + "\n")
 
-    def run_crawler(self, *extra):
-        args = ["--data", self.source, "--cache", self.cache, "--report", self.report,
+    def run_crawler(self, *extra, expected_exit=0):
+        args = ["--transport", "http", "--data", self.source, "--cache", self.cache, "--report", self.report,
                 "--delay", "0", "--delay-jitter", "0", "--backoff", "0", "--backoff-jitter", "0", *extra]
         with patch.object(sys, "argv", [SCHOLAR.__file__, *map(str, args)]), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(SCHOLAR.main(), 0)
+            self.assertEqual(SCHOLAR.main(), expected_exit)
         return json.loads(self.cache.read_text())[URL]
 
     def store(self):
@@ -105,7 +105,8 @@ class ScholarCaptureTests(unittest.TestCase):
         ):
             kwargs = {"side_effect": response} if isinstance(response, Exception) else {"return_value": response}
             with patch.object(SCHOLAR.urllib.request, "urlopen", **kwargs):
-                entry = self.run_crawler("--refresh", "--max-retries", "0")
+                entry = self.run_crawler("--refresh", "--max-retries", "0",
+                                         expected_exit=1 if isinstance(response, Response) and b"unusual traffic" in response.getvalue() else 0)
             self.assertEqual(entry["capture_id"], good["capture_id"])
             self.assertEqual(entry["citations"], "123")
             self.assertIn("last_fetch_error", entry)
@@ -116,6 +117,34 @@ class ScholarCaptureTests(unittest.TestCase):
         self.assertNotIn("last_fetch_error", fresh)
         self.assertEqual((self.work / good["html_path"]).read_text(), HTML)
         self.assertEqual(len(self.store().manifest["captures"]), 6)
+
+    def test_unusual_traffic_stops_before_retry_or_next_profile(self):
+        raw = b"<html>Our systems have detected unusual traffic from your computer network.</html>"
+        self.source.write_text("name,google_scholar_profile\nExample Person," + URL +
+                               "\nSecond Person,https://scholar.google.com/citations?user=second\n")
+        for code in (200, 429, 403):
+            with self.subTest(code=code):
+                response = (Response(raw) if code == 200 else
+                            urllib.error.HTTPError(URL, code, "blocked", Message(), io.BytesIO(raw)))
+                kwargs = {"return_value": response} if code == 200 else {"side_effect": response}
+                with patch.object(SCHOLAR.urllib.request, "urlopen", **kwargs) as fetch, \
+                     patch.object(SCHOLAR.time, "sleep") as sleep:
+                    entry = self.run_crawler("--refresh", "--max-retries", "2", expected_exit=1)
+                self.assertEqual(fetch.call_count, 1)
+                sleep.assert_not_called()
+                self.assertEqual(entry["status"], "blocked")
+                self.assertEqual(entry["status_code"], code)
+                self.assertFalse(entry["retry_pending"])
+                self.assertEqual((self.work / entry["html_path"]).read_bytes(), raw)
+                report = json.loads(self.report.read_text())
+                self.assertEqual(report["status_counts"], {"blocked": 1, "missing": 1})
+                self.assertEqual(self.store().manifest["captures"][-1]["status"], "blocked")
+
+    def test_block_check_does_not_depend_on_profile_parser(self):
+        with patch.object(SCHOLAR.urllib.request, "urlopen", return_value=Response(b"unusual traffic")), \
+             patch.object(SCHOLAR, "parse_profile_html", side_effect=ValueError("parser failed")):
+            entry = self.run_crawler(expected_exit=1)
+        self.assertEqual(entry["status"], "blocked")
 
     def test_retries_archive_error_bytes_and_success_separately(self):
         raw = b"<html>busy\xff</html>"

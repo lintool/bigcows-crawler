@@ -5,9 +5,9 @@ The script is intentionally conservative:
 
 - cached URLs, including cached HTML pages, are never fetched again unless --refresh is passed
 - cached entries without a stored HTML page are treated as incomplete and fetched again
-- each uncached request waits --delay seconds, plus optional --delay-jitter
-- every jittered batch of uncached requests, the script pauses for --batch-pause seconds, plus optional jitter
-- transient fetch failures are retried with exponential backoff
+- each uncached request waits --delay seconds, with symmetric --delay-jitter
+- every jittered batch of uncached requests, the script pauses for --batch-pause seconds, with symmetric jitter
+- Safari failures stop the run; legacy HTTP transient failures use exponential backoff
 - raw response files and a manifest retain every attempt, including retries
 - the derived cache and report can be rebuilt offline from those captures
 
@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import ExitStack
 import hashlib
 import html
 import json
 import random
 import re
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -44,7 +46,7 @@ DEFAULT_REPORT = CRAWLER_ROOT / ".cache" / "google-scholar-profile-report.json"
 SUFFIXES = {"jr", "jr.", "sr", "sr.", "ii", "iii", "iv"}
 PARTICLES = {"al", "bin", "da", "de", "del", "den", "der", "di", "du", "la", "le", "van", "von"}
 TRANSIENT_HTTP_STATUS = {408, 425, 429, 500, 502, 503, 504}
-HTML_REQUIRED_STATUSES = {"ok", "blocked", "http_error", "no_title", "parse_error"}
+HTML_REQUIRED_STATUSES = {"ok", "blocked", "http_error", "no_title", "parse_error", "redirect_review", "validation_error"}
 PARSER_DERIVED_STATUSES = {"ok", "blocked", "no_title", "parse_error"}
 PROFILE_CSV_COLUMNS = [
     "name",
@@ -159,14 +161,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-write-csv", action="store_true", help="Skip writing the enriched Scholar profile CSV.")
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="JSON cache path.")
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT, help="JSON report path.")
+    parser.add_argument("--transport", choices=("safari", "http"), default="safari", help="Safari on macOS (default), or explicit legacy HTTP fetching.")
+    parser.add_argument("--timeout", type=float, default=60, help="Safari page load timeout in seconds.")
     parser.add_argument("--page-size", type=int, choices=(20, 100), default=100, help="Publications requested on the first page (default: 100); no additional pages are fetched.")
     parser.add_argument("--rebuild-cache", action="store_true", help="Rebuild the derived cache from the capture manifest, without network requests.")
-    parser.add_argument("--delay", type=float, default=5.0, help="Base seconds to wait between uncached requests.")
-    parser.add_argument("--delay-jitter", type=float, default=2.0, help="Random extra seconds added to --delay.")
+    parser.add_argument("--delay", type=float, default=15.0, help="Base seconds to wait between uncached requests.")
+    parser.add_argument("--delay-jitter", type=float, default=5.0, help="Random +/- seconds around --delay.")
     parser.add_argument("--batch-size", type=int, default=25, help="Base uncached requests per batch.")
     parser.add_argument("--batch-size-jitter", type=int, default=0, help="Random +/- adjustment to --batch-size.")
-    parser.add_argument("--batch-pause", type=float, default=120.0, help="Base seconds to pause after each batch.")
-    parser.add_argument("--batch-pause-jitter", type=float, default=30.0, help="Random extra seconds added to --batch-pause.")
+    parser.add_argument("--batch-pause", type=float, default=75.0, help="Base seconds to pause after each batch.")
+    parser.add_argument("--batch-pause-jitter", type=float, default=15.0, help="Random +/- seconds around --batch-pause.")
     parser.add_argument("--max-retries", type=int, default=1, help="Retries for transient fetch failures.")
     parser.add_argument("--backoff", type=float, default=10.0, help="Base seconds for exponential retry backoff.")
     parser.add_argument("--backoff-jitter", type=float, default=5.0, help="Random extra seconds added to retry backoff.")
@@ -179,6 +183,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--refresh", action="store_true", help="Refetch URLs even when cached.")
     args = parser.parse_args()
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
     if args.rebuild_cache and (args.refresh or args.retry_status):
         parser.error("--rebuild-cache cannot be combined with --refresh or --retry-status")
     return args
@@ -247,7 +253,7 @@ class CaptureStore:
             entry["encoding"] = "utf-8"
             entry["body_source"] = "legacy-decoded-html"
         elif raw is not None:
-            entry["body_source"] = "http-response-bytes"
+            entry.setdefault("body_source", "http-response-bytes")
         entry["profile_url"] = canonical_scholar_url(url)
         entry.setdefault("requested_url", url)
         query = urllib.parse.parse_qs(urllib.parse.urlparse(entry["requested_url"]).query)
@@ -280,7 +286,7 @@ class CaptureStore:
             "capture_id", "profile_url", "requested_url", "final_url", "fetched_at",
             "status", "status_code", "error", "encoding", "response_headers",
             "cstart", "pagesize", "html_path", "html_sha256", "html_bytes", "body_source",
-            "attempts", "retry_pending",
+            "attempts", "retry_pending", "fetch_method",
         )
         capture = {key: entry[key] for key in fields if key in entry}
         self.manifest["captures"].append(capture)
@@ -562,8 +568,11 @@ def should_retry(result: dict[str, Any]) -> bool:
     )
 
 
-def sleep_seconds(base: float, jitter: float) -> float:
-    return max(0.0, base + random.uniform(0, max(0.0, jitter)))
+def sleep_seconds(base: float, jitter: float, *, symmetric: bool = False) -> float:
+    if symmetric and base <= 0:
+        return 0.0
+    jitter = max(0.0, jitter)
+    return max(0.0, base + random.uniform(-jitter if symmetric else 0, jitter))
 
 
 def batch_target(base: int, jitter: int) -> int:
@@ -615,7 +624,7 @@ def fetch_profile_once(url: str, page_size: int = 100) -> dict[str, Any]:
             metadata["error"] = f"Could not read HTTP error body: {read_error}"
         return {
             **metadata,
-            "status": "http_error",
+            "status": "blocked" if is_blocked_page(body) else "http_error",
             "status_code": error.code,
             "title": "",
             "html": body,
@@ -633,6 +642,10 @@ def fetch_profile_once(url: str, page_size: int = 100) -> dict[str, Any]:
     except (TimeoutError, socket.timeout):
         return {**metadata, "status": "timeout", "title": "", "html": ""}
 
+    if is_blocked_page(body):
+        return {**metadata, "status": "blocked", "status_code": status_code,
+                "title": "", "html": body, "fetched_at": fetched_at}
+
     try:
         parsed = parse_profile_html(body)
     except Exception as error:
@@ -640,9 +653,7 @@ def fetch_profile_once(url: str, page_size: int = 100) -> dict[str, Any]:
         return {**metadata, "status": "parse_error", "status_code": status_code,
                 "html": body, "error": f"{type(error).__name__}: {error}"}
     title = parsed.get("title", "")
-    if is_blocked_page(body):
-        status = "blocked"
-    elif not title:
+    if not title:
         status = "no_title"
     else:
         status = "ok"
@@ -667,6 +678,97 @@ def fetch_profile_once(url: str, page_size: int = 100) -> dict[str, Any]:
     }
 
 
+class PublicationCoverageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.count = 0
+        self.exhausted = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "tr" and "gsc_a_tr" in attrs.get("class", "").split():
+            self.count += 1
+        if tag == "button" and attrs.get("id") == "gsc_bpf_more":
+            self.exhausted = "disabled" in attrs
+
+
+def scholar_profile_id(url):
+    parsed = urllib.parse.urlparse(url)
+    if (parsed.scheme != "https" or parsed.netloc != "scholar.google.com"
+            or parsed.path != "/citations"):
+        return None
+    return urllib.parse.parse_qs(parsed.query).get("user", [None])[0]
+
+
+def classify_safari(requested_url, final_url, body):
+    # Safari exposes page source, not HTTP status or original wire bytes.
+    if is_blocked_page(body) or "/sorry/" in final_url:
+        return {"status": "blocked", "title": ""}
+    if not scholar_profile_id(requested_url) or scholar_profile_id(final_url) != scholar_profile_id(requested_url):
+        return {"status": "redirect_review", "title": "", "error": "Final URL is not the requested Scholar profile."}
+    if "</html>" not in body.lower():
+        return {"status": "validation_error", "title": "", "error": "Incomplete Safari page source."}
+    try:
+        parsed = parse_profile_html(body)
+        coverage = PublicationCoverageParser()
+        coverage.feed(body)
+    except Exception as error:
+        return {"status": "parse_error", "error": f"{type(error).__name__}: {error}"}
+    page_size = int(urllib.parse.parse_qs(urllib.parse.urlparse(requested_url).query).get("pagesize", [100])[0])
+    result = {**parsed, "publication_count": coverage.count, "publications_exhausted": coverage.exhausted}
+    if not parsed.get("title") or not re.search(r'id=[\'"]gsc_prf_in[\'"]', body):
+        return {**result, "status": "no_title", "error": "No Scholar profile identity markup."}
+    if coverage.count != page_size and not (coverage.count < page_size and coverage.exhausted):
+        return {**result, "status": "validation_error", "error": f"Expected {page_size} publication rows or an exhausted list; found {coverage.count}."}
+    return {**result, "status": "ok"}
+
+
+class SafariFetcher:
+    """Lazily own one dedicated Safari window; never fall back to HTTP."""
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self.window = None
+
+    def close(self):
+        if self.window is not None:
+            from cache_acm_fellow_profiles_safari import close_window
+            try:
+                close_window(self.window)
+            except (OSError, subprocess.SubprocessError) as error:
+                print(f"Safari window cleanup warning: {error}", file=sys.stderr)
+            finally:
+                self.window = None
+
+    def fetch(self, url, page_size=100):
+        from cache_acm_fellow_profiles_safari import run_applescript
+        from cache_dblp_profiles_safari import open_window
+        entry = {"status_code": None, "title": "", "html": "",
+                 "fetch_method": "safari-applescript",
+                 "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        user = scholar_profile_id(url)
+        if not user:
+            return {**entry, "status": "invalid_url", "error": "Expected an HTTPS scholar.google.com/citations?user= profile."}
+        query = urllib.parse.urlencode({"user": user, "hl": "en", "oi": "ao", "pagesize": page_size, "cstart": 0})
+        requested = "https://scholar.google.com/citations?" + query
+        entry["requested_url"] = requested
+        try:
+            if sys.platform != "darwin":
+                raise OSError("Safari fetching requires macOS.")
+            if self.window is None:
+                self.window = open_window()
+            output = run_applescript(Path(__file__).with_name("scholar_safari_fetch.applescript"),
+                                     self.window, requested, self.timeout, timeout=self.timeout + 20)
+            final_url, body = output.split("\n", 1)
+            entry.update(final_url=final_url, html=body, _raw_body=body.encode("utf-8"),
+                         encoding="utf-8", body_source="safari-page-source")
+            return {**entry, **classify_safari(requested, final_url, body)}
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            # Local automation failures need review, not repeated navigations.
+            message = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
+            return {**entry, "status": "browser_error", "error": message}
+
+
 def response_metadata(raw: bytes, headers: Any, final_url: str) -> dict[str, Any]:
     return {
         "_raw_body": raw,
@@ -677,10 +779,10 @@ def response_metadata(raw: bytes, headers: Any, final_url: str) -> dict[str, Any
 
 
 def fetch_profile(url: str, max_retries: int, backoff: float, backoff_jitter: float,
-                  *, page_size: int = 100, capture_store: CaptureStore | None = None) -> dict[str, Any]:
+                  *, page_size: int = 100, capture_store: CaptureStore | None = None, fetch_once=None) -> dict[str, Any]:
     attempts = 0
     while True:
-        result = fetch_profile_once(url, page_size)
+        result = (fetch_once or fetch_profile_once)(url, page_size)
         result["attempts"] = attempts + 1
         result["retry_pending"] = attempts < max_retries and should_retry(result)
         if capture_store is not None:
@@ -714,6 +816,11 @@ def enrich_cache_from_html(cache: dict[str, Any], store: CaptureStore | None = N
         if not body:
             continue
         try:
+            if cached.get("fetch_method") == "safari-applescript":
+                classified = classify_safari(cached["requested_url"], cached.get("final_url", ""), body)
+                cached.pop("error", None)
+                cached.update(classified)
+                continue
             parsed = parse_profile_html(body)
         except Exception as error:
             if can_reclassify(cached):
@@ -777,6 +884,9 @@ def build_report(profiles: list[ScholarProfile], cache: dict[str, Any]) -> dict[
                 "i10_index_since_5y_ago": cached.get("i10_index_since_5y_ago", ""),
                 "first_citation_year": cached.get("first_citation_year", ""),
                 "citation_by_year": cached.get("citation_by_year", {}),
+                "fetch_method": cached.get("fetch_method"),
+                "publication_count": cached.get("publication_count"),
+                "publications_exhausted": cached.get("publications_exhausted"),
                 "html_cached": has_html(cached),
                 "html_path": cached.get("html_path"),
                 "html_error": cached.get("html_error"),
@@ -873,6 +983,11 @@ def write_profile_csv(path: Path, profiles: list[ScholarProfile], cache: dict[st
 
 def main() -> int:
     args = parse_args()
+    with ExitStack() as cleanup:
+        return crawl(args, cleanup)
+
+
+def crawl(args, cleanup) -> int:
     rows = load_rows(args.data)
     profiles = unique_profiles(rows)
     cache: dict[str, Any] = {} if args.rebuild_cache else normalize_cache_keys(load_json(args.cache, {}))
@@ -884,6 +999,10 @@ def main() -> int:
     store.replay(cache)
     enrich_cache_from_html(cache, store)
     retry_statuses = set(args.retry_status)
+
+    safari = SafariFetcher(args.timeout) if args.transport == "safari" else None
+    if safari is not None:
+        cleanup.callback(safari.close)
 
     new_requests = 0
     batch_requests = 0
@@ -903,7 +1022,7 @@ def main() -> int:
             break
 
         if batch_requests >= current_batch_target:
-            pause = sleep_seconds(args.batch_pause, args.batch_pause_jitter)
+            pause = sleep_seconds(args.batch_pause, args.batch_pause_jitter, symmetric=True)
             print(f"Pausing {pause:.1f}s after {batch_requests} uncached requests.", flush=True)
             time.sleep(pause)
             batch_requests = 0
@@ -911,7 +1030,8 @@ def main() -> int:
 
         print(f"[{position}/{len(profiles)}] fetching {profile.name}: {profile.url}", flush=True)
         result = fetch_profile(profile.url, args.max_retries, args.backoff, args.backoff_jitter,
-                               page_size=args.page_size, capture_store=store)
+                               page_size=args.page_size, capture_store=store,
+                               fetch_once=safari.fetch if safari else None)
         if not result.get("capture_id"):
             result = store.save(profile.url, result)
         retain_result(cache, profile.url, result)
@@ -921,7 +1041,14 @@ def main() -> int:
         atomic_write_json(args.cache, cache)
         atomic_write_json(args.report, build_report(profiles, cache))
 
-        delay = sleep_seconds(args.delay, args.delay_jitter)
+        if result.get("status") == "blocked" or (safari and result.get("status") != "ok"):
+            print(f"Stopped: {result.get('status')}. "
+                  "Capture and report saved; wait and inspect before retrying.", flush=True)
+            return 1
+
+        # The batch cooldown replaces the per-profile delay, as in DBLP.
+        delay = (sleep_seconds(args.delay, args.delay_jitter, symmetric=True)
+                 if batch_requests < current_batch_target else 0)
         if delay > 0:
             time.sleep(delay)
 
