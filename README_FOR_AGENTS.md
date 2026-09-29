@@ -5,6 +5,15 @@ The human overview and basic usage live in [README.md](README.md).
 This file owns detailed crawler workflows, implementation notes, validation, and troubleshooting.
 Keep canonical datasets, joins, visualizations, and dataset-specific reconciliation history in the consuming applications.
 
+## Application Workflow Boundary
+
+The consuming application's [four-stage workflow](https://github.com/lintool/acm-bigcows/blob/master/README_FOR_AGENTS.md#four-stage-workflow) separates **crawl → review → extract → visualize**.
+This repository supplies crawl transport and retained evidence: stable inputs, raw responses, hashes, timestamps, final URLs and fetch outcomes as documented by each crawler's schema.
+Its parsers and reports can support review and extraction, but parsed fields, an `ok` fetch or a generic CSV export do not establish identity, quality or application acceptance.
+The consuming application owns review decisions, accepted-capture selection, canonical extraction/import and visualization generation.
+Retain source provenance when passing captures or parsed values downstream; do not use an export timestamp as a capture timestamp.
+Authorizing a crawl does not automatically authorize canonical imports or visualization updates.
+
 ## Shared Conventions
 
 ### Inputs and Paths
